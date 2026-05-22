@@ -37,23 +37,21 @@ br_start() {
     # Use nohup so output goes to log-file rather than own tty.
     # Using setsid to detach fully from parent pgrp so the background session
     # is not killed when the parent exits.
-    nohup python3 "$BRIDGE_HOST" >> "$BRIDGE_LOG" 2>&1 &
-    disown $! 2>/dev/null || true
+    python3 "$BRIDGE_HOST" >> "$BRIDGE_LOG" 2>&1 &
+    BRIDGE_PID=$!
+    disown "$BRIDGE_PID" 2>/dev/null || true
+    echo "$BRIDGE_PID" > "$PID_FILE"
 
-    # Wait up to 10s for PID file
+    # Wait up to 10s for the process to confirm it is alive
     for i in $(seq 1 20); do
-        if [[ -f "$PID_FILE" ]]; then
-            local pid
-            pid=$(cat "$PID_FILE")
-            if kill -0 "$pid" 2>/dev/null; then
-                echo "Bridge started (PID $pid)."
-                return 0
-            fi
+        if kill -0 "$BRIDGE_PID" 2>/dev/null; then
+            echo "Bridge started (PID $BRIDGE_PID)."
+            return 0
         fi
         sleep 0.5
     done
 
-    # Fallback: locate process by port
+    # Fallback: locate process by port (handles PID wrap-around races)
     local p
     p=$(lsof -ti :$HTTP_PORT 2>/dev/null | head -1 || true)
     if [[ -n "$p" ]]; then

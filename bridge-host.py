@@ -348,6 +348,12 @@ async def main():
             break
     _pre_ll = _setup_logging(_re_ll or getattr(_cli_log_level, "value", "WARNING"))
     log = _pre_ll
+    start_time = time.time()
+    total_requests = 0
+    successful_requests = 0
+    timed_out_requests = 0
+    failed_requests = 0
+    last_response_time = None
     log.info("bridge_starting", extra={"queue_len": HTTP_PORT, "qc": WS_PORT})
 
     connected_extensions = set()
