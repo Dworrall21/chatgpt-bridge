@@ -355,56 +355,55 @@ def main() -> int:
     model_prompt = "Write one short, vivid sentence about a bridge crossing a stormy river."
     plain = request_json_retry(
         "POST",
-        "/chat",
-        body={"prompt": model_prompt, "timeout": LONG_TIMEOUT},
+        "/v1/chat/completions",
+        body={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": model_prompt}],
+            "timeout": LONG_TIMEOUT,
+        },
         timeout=LONG_TIMEOUT + 30,
     )
     search = request_json_retry(
-        "POST",
-        "/chat",
-        body={"prompt": model_prompt, "model_search": "thinking", "timeout": LONG_TIMEOUT},
-        timeout=LONG_TIMEOUT + 30,
-    )
-    plain_text = plain.body.get("text") if isinstance(plain.body, dict) else ""
-    search_text = search.body.get("text") if isinstance(search.body, dict) else ""
-    ok5 = bool(
-        plain.status == 200
-        and search.status == 200
-        and isinstance(plain_text, str)
-        and isinstance(search_text, str)
-        and plain_text.strip()
-        and search_text.strip()
-        and search.body.get("success") is True
-        and plain.body.get("success") is True
-        and (plain_text != search_text or plain.body.get("conversation_id") != search.body.get("conversation_id"))
-    )
-    record(
-        "model_search accepted",
-        ok5,
-        f"plain={plain_text!r}, model_search={search_text!r}, plain_conv={plain.body.get('conversation_id')!r}, search_conv={search.body.get('conversation_id')!r}",
-    )
-    if not ok5:
-        return 1
-
-    v1_model_search = request_json_retry(
         "POST",
         "/v1/chat/completions",
         body={
             "model": "chatgpt",
             "messages": [{"role": "user", "content": model_prompt}],
-            "model_search": "thinking",
+            "model_search": "try-again",
             "timeout": LONG_TIMEOUT,
         },
         timeout=LONG_TIMEOUT + 30,
     )
-    body5b = v1_model_search.body if isinstance(v1_model_search.body, dict) else {}
-    ok5b = bool(v1_model_search.status == 200 and body5b.get("object") == "chat.completion")
-    record(
-        "model_search accepted (v1)",
-        ok5b,
-        f"status={v1_model_search.status}, object={body5b.get('object')!r}, model={body5b.get('model')!r}",
+    plain_body = plain.body if isinstance(plain.body, dict) else {}
+    search_body = search.body if isinstance(search.body, dict) else {}
+    plain_choices = plain_body.get("choices") if isinstance(plain_body, dict) else None
+    search_choices = search_body.get("choices") if isinstance(search_body, dict) else None
+    plain_text = (
+        plain_choices[0].get("message", {}).get("content", "")
+        if isinstance(plain_choices, list) and plain_choices else ""
     )
-    if not ok5b:
+    search_text = (
+        search_choices[0].get("message", {}).get("content", "")
+        if isinstance(search_choices, list) and search_choices else ""
+    )
+    ok5 = bool(
+        plain.status == 200
+        and search.status == 200
+        and plain_body.get("object") == "chat.completion"
+        and search_body.get("object") == "chat.completion"
+        and isinstance(plain_text, str)
+        and isinstance(search_text, str)
+        and plain_text.strip()
+        and search_text.strip()
+        and search_body.get("conversation_id")
+        and (plain_text != search_text or plain_body.get("conversation_id") != search_body.get("conversation_id"))
+    )
+    record(
+        "model_search accepted",
+        ok5,
+        f"plain={plain_text!r}, model_search={search_text!r}, plain_conv={plain_body.get('conversation_id')!r}, search_conv={search_body.get('conversation_id')!r}",
+    )
+    if not ok5:
         return 1
 
     print("\n=== Test 6: Streaming (SSE) ===")
