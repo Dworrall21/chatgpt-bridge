@@ -1,0 +1,157 @@
+#!/bin/bash
+# chatgpt-chat — Send a prompt to ChatGPT via the bridge
+# Usage:
+#   chatgpt-chat "Your prompt here"
+#   chatgpt-chat --file prompt.txt
+#   echo "prompt" | chatgpt-chat
+#   chatgpt-chat --timeout 300 "long prompt"
+#   chatgpt-chat --model-search "thinking" "deep analysis prompt"
+#   chatgpt-chat -m o3 "complex reasoning prompt"
+#   chatgpt-chat --conversation-id UUID "follow-up prompt"
+#   chatgpt-chat --health
+#   chatgpt-chat --reload
+
+set -eo pipefail
+
+BRIDGE_URL="http://127.0.0.1:11557"
+HOST_SCRIPT="$HOME/chatgpt-extension/bridge-host.py"
+
+# Parse optional flags before positional args
+TIMEOUT=10
+CONVERSATION_ID=""
+MODEL_SEARCH=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --timeout|-T)
+      TIMEOUT="${2:?missing value for --timeout}"
+      shift 2
+      ;;
+    --model-search|-m)
+      MODEL_SEARCH="${2:?missing value for --model-search}"
+      shift 2
+      ;;
+    --conversation-id|-c)
+      CONVERSATION_ID="${2:?missing value for --conversation-id}"
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+case "${1:-}" in
+  --reload)
+    curl -s -X POST "$BRIDGE_URL/reload" 2>/dev/null
+    exit 0
+    ;;
+  --health)
+    curl -s "$BRIDGE_URL/health" 2>/dev/null || echo "Bridge not running"
+    exit 0
+    ;;
+  --help|-h)
+    cat <<USAGE
+Usage: chatgpt-chat [--timeout N] [--model-search TERM] [--conversation-id UUID] ["prompt" | --file PATH | stdin]
+  "prompt"               Send a prompt string
+  --file PATH            Send contents of a file as the prompt
+  --timeout N            Set timeout in seconds (default: 10)
+  --model-search TERM    Select a ChatGPT model before prompting (e.g. "thinking", "o3")
+  -m TERM                Shorthand for --model-search
+  --conversation-id UUID Continue an existing conversation
+  -c UUID                Shorthand for --conversation-id
+  --health               Check bridge status
+  --reload               Reload extension + ChatGPT tab
+  -h / --help            Show this help
+  echo "prompt" | chatgpt-chat   Read prompt from stdin
+
+Model search examples:
+  chatgpt-chat -m thinking "Think deeply about this math problem"
+  chatgpt-chat --model-search o3 "Complex reasoning task"
+
+Conversation continuity:
+  After each response, the bridge prints the conversation_id.
+  Pass it back with -c to continue the same thread:
+    chatgpt-chat "first prompt"
+    # → [conversation_id: abc-123]
+    chatgpt-chat -c abc-123 "follow-up prompt"
+USAGE
+    exit 0
+    ;;
+  --file)
+    if [[ -z "${2:-}" ]]; then
+      echo "Usage: chatgpt-chat --file <path>" >&2
+      exit 1
+    fi
+    PROMPT=$(cat "$2")
+    ;;
+  "")
+    if [ -t 0 ]; then
+      echo "Usage: chatgpt-chat \"prompt\"  (or use --file, --health, --help)" >&2
+      exit 1
+    fi
+    PROMPT=$(cat)
+    ;;
+  *)
+    PROMPT="$*"
+    ;;
+esac
+
+if [[ -z "${PROMPT:-}" ]]; then
+  echo "Error: empty prompt" >&2
+  exit 1
+fi
+
+# Validate --timeout is a positive integer
+if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || [[ "$TIMEOUT" -le 0 ]]; then
+  echo "Error: --timeout must be a positive integer (got: $TIMEOUT)" >&2
+  exit 1
+fi
+
+# Send prompt to bridge, parse JSON response
+CURL_TIMEOUT=$(( TIMEOUT + 30 ))
+
+# Build the payload, including conversation_id and model_search if set
+echo "$PROMPT" | python3 -c "
+import sys, json, subprocess
+
+prompt = sys.stdin.read()
+timeout = $TIMEOUT
+conversation_id = '$CONVERSATION_ID' or None
+model_search = '$MODEL_SEARCH' or None
+
+payload_dict = {'prompt': prompt, 'timeout': timeout}
+if conversation_id:
+    payload_dict['conversation_id'] = conversation_id
+if model_search:
+    payload_dict['model_search'] = model_search
+
+payload = json.dumps(payload_dict)
+result = subprocess.run([
+    'curl', '-s', '--max-time', '$CURL_TIMEOUT',
+    '-X', 'POST', 'http://127.0.0.1:11557/chat',
+    '-H', 'Content-Type: application/json',
+    '-d', payload,
+], capture_output=True, text=True)
+
+if not result.stdout.strip():
+    print('Error: no response from bridge (is it running?)', file=sys.stderr)
+    sys.exit(1)
+
+try:
+    data = json.loads(result.stdout)
+except json.JSONDecodeError as e:
+    print(f'Parse error: {e}', file=sys.stderr)
+    sys.exit(1)
+
+if data.get('success'):
+    print(data.get('text', data.get('response', '')))
+    conv_id = data.get('conversation_id')
+    conv_title = data.get('conversation_title')
+    if conv_id:
+        print(f'[conversation_id: {conv_id}]', file=sys.stderr)
+    if conv_title:
+        print(f'[conversation_title: {conv_title}]', file=sys.stderr)
+else:
+    print('Error:', data.get('error', 'unknown'), file=sys.stderr)
+    sys.exit(1)
+"

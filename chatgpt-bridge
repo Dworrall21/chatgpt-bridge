@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# chatgpt-bridge — CLI daemon for the ChatGPT Bridge.
+#
+# Commands:
+#   start          Launch bridge-host.py in background, write PID file
+#   stop           Send SIGTERM → wait 10s → SIGKILL if needed; remove PID file
+#   restart        stop + start
+#   status         Check PID file + HTTP /health, report uptime and extension count
+#
+# PID file: ~/.hermes/chatgpt_bridge.pid
+# Bridge:   ~/chatgpt-extension/bridge-host.py
+# Ports:    HTTP 11557, WS 11558
+
+set -euo pipefail
+
+PID_FILE="${HOME}/.hermes/chatgpt_bridge.pid"
+BRIDGE_DIR="${HOME}/chatgpt-extension"
+BRIDGE_HOST="${BRIDGE_DIR}/bridge-host.py"
+HEALTH_URL="http://127.0.0.1:11557/health"
+BRIDGE_LOG="${BRIDGE_DIR}/bridge-host.log"
+HTTP_PORT=11557
+
+usage() {
+    echo "Usage: chatgpt-bridge {start|stop|restart|status}"
+    exit 1
+}
+
+br_start() {
+    # If already running, skip
+    if _br_is_running; then
+        echo "Bridge is already running (PID $(cat "$PID_FILE"))."
+        return 0
+    fi
+
+    echo "Starting ChatGPT Bridge..."
+
+    # Use nohup so output goes to log-file rather than own tty.
+    # Using setsid to detach fully from parent pgrp so the background session
+    # is not killed when the parent exits.
+    nohup python3 "$BRIDGE_HOST" >> "$BRIDGE_LOG" 2>&1 &
+    disown $! 2>/dev/null || true
+
+    # Wait up to 10s for PID file
+    for i in $(seq 1 20); do
+        if [[ -f "$PID_FILE" ]]; then
+            local pid
+            pid=$(cat "$PID_FILE")
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "Bridge started (PID $pid)."
+                return 0
+            fi
+        fi
+        sleep 0.5
+    done
+
+    # Fallback: locate process by port
+    local p
+    p=$(lsof -ti :$HTTP_PORT 2>/dev/null | head -1 || true)
+    if [[ -n "$p" ]]; then
+        echo "$p" > "$PID_FILE"
+        echo "Bridge started (PID $p, PID file recovered from port)."
+        return 0
+    fi
+
+    echo "ERROR: Bridge process did not appear within 10s."
+    echo "Check ${BRIDGE_LOG} for errors."
+    return 1
+}
+
+_br_is_running() {
+    [[ -f "$PID_FILE" ]] || return 1
+    local pid
+    pid=$(cat "$PID_FILE")
+    kill -0 "$pid" 2>/dev/null || return 1
+    return 0
+}
+
+br_stop() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        echo "PID file not found ($PID_FILE). Bridge may not be running."
+        return 1
+    fi
+
+    local pid
+    pid=$(cat "$PID_FILE")
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "PID $pid is not running. Cleaning up stale PID file."
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    echo "Stopping bridge (PID $pid)…"
+    kill -TERM "$pid" 2>/dev/null || true
+
+    # Wait up to 10s for clean exit
+    local i
+    for i in $(seq 1 20); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "Bridge stopped."
+            rm -f "$PID_FILE"
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    echo "Bridge did not exit after 10s; sending SIGKILL…"
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 0.5
+    rm -f "$PID_FILE"
+    echo "Bridge killed."
+    return 0
+}
+
+br_restart() {
+    br_stop || true
+    sleep 1
+    br_start
+}
+
+br_status() {
+    local ext_count=0
+    local uptime="N/A"
+    local pid_info="not running"
+    local http_ok=false
+
+    # 1. PID file check
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            pid_info="running (PID $pid)"
+            http_ok=true
+        else
+            pid_info="stale (PID $pid, process gone)"
+        fi
+    fi
+
+    # 2. HTTP /health check
+    local http_code="—"
+    local health_body=""
+    if $http_ok; then
+        local response
+        response=$(curl -sf --connect-timeout 3 --max-time 5 "$HEALTH_URL" 2>&1) || true
+        http_code=$?
+        if [[ $http_code -eq 0 ]]; then
+            http_ok=true
+            health_body="$response"
+        else
+            http_ok=false
+        fi
+    fi
+
+    # Parse health JSON for extension count and uptime
+    if [[ -n "$health_body" ]]; then
+        # Try python first; fall back to grep/awk
+        if command -v python3 &>/dev/null; then
+            ext_count=$(python3 -c "
+import json,sys
+try:
+    d=json.loads(sys.stdin.read())
+    print(d.get('extensions', 0))
+except: print(0)
+" <<< "$health_body" 2>/dev/null || echo "0")
+            uptime=$(python3 -c "
+import json,sys
+try:
+    d=json.loads(sys.stdin.read())
+    print(d.get('uptime','N/A'))
+except: print('N/A')
+" <<< "$health_body" 2>/dev/null || echo "N/A")
+        fi
+    fi
+
+    echo "ChatGPT Bridge Status"
+    echo "  Process:  $pid_info"
+    if $http_ok; then
+        echo "  HTTP:     responding (http://127.0.0.1:$HTTP_PORT)"
+        echo "  Extensions connected: $ext_count"
+        echo "  Uptime:   $uptime"
+    else
+        echo "  HTTP:     NOT responding"
+        echo "  Extensions connected: $ext_count (—)"
+        echo "  Uptime:   $uptime"
+    fi
+}
+
+# ── main ──
+
+command="${1:-}"
+
+case "$command" in
+    start)  br_start  ;;
+    stop)   br_stop   ;;
+    restart)br_restart ;;
+    status) br_status ;;
+    *)      usage     ;;
+esac
