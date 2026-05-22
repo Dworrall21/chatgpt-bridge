@@ -120,13 +120,43 @@ _MODEL_CATALOG_CANDIDATES = [
     Path.home() / ".hermes" / "chatgpt_bridge_state" / "model_catalog.json",
     Path.home() / ".hermes" / "chatgpt_bridge_state" / "models.json",
 ]
+_MODEL_CATALOG_CACHE_TTL_SECONDS = 10
+_MODEL_CATALOG_CACHE_MODELS = None
+_MODEL_CATALOG_CACHE_SOURCE_PATH = None
+_MODEL_CATALOG_CACHE_SOURCE_MTIME = None
+_MODEL_CATALOG_CACHE_LOADED_AT = None
 
 
 def load_available_models():
+    global _MODEL_CATALOG_CACHE_MODELS
+    global _MODEL_CATALOG_CACHE_SOURCE_PATH
+    global _MODEL_CATALOG_CACHE_SOURCE_MTIME
+    global _MODEL_CATALOG_CACHE_LOADED_AT
+
+    now = time.monotonic()
+    cached_models = _MODEL_CATALOG_CACHE_MODELS
+    cached_path = _MODEL_CATALOG_CACHE_SOURCE_PATH
+    cached_mtime = _MODEL_CATALOG_CACHE_SOURCE_MTIME
+    loaded_at = _MODEL_CATALOG_CACHE_LOADED_AT
+
+    if (
+        cached_models is not None
+        and cached_path is not None
+        and cached_mtime is not None
+        and loaded_at is not None
+        and (now - loaded_at) <= _MODEL_CATALOG_CACHE_TTL_SECONDS
+    ):
+        try:
+            if cached_path.exists() and cached_path.stat().st_mtime == cached_mtime:
+                return list(cached_models)
+        except OSError:
+            pass
+
     for path in _MODEL_CATALOG_CANDIDATES:
         try:
             if not path.exists():
                 continue
+            source_mtime = path.stat().st_mtime
             data = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError, TypeError):
             continue
@@ -155,7 +185,12 @@ def load_available_models():
                     available.append(str(model_id))
 
         if available:
-            return sorted(dict.fromkeys(available))
+            models = sorted(dict.fromkeys(available))
+            _MODEL_CATALOG_CACHE_MODELS = list(models)
+            _MODEL_CATALOG_CACHE_SOURCE_PATH = path
+            _MODEL_CATALOG_CACHE_SOURCE_MTIME = source_mtime
+            _MODEL_CATALOG_CACHE_LOADED_AT = now
+            return models
     return []
 
 
