@@ -45,7 +45,7 @@ _TRUSTED_URL_HOSTS = frozenset({
     "openai.com",
     "openai-svc.com",
 })
-_TRUSTED_URL_ALLOW_ALL_HTTPS = True
+_TRUSTED_URL_ALLOW_ALL_HTTPS = os.getenv("BRIDGE_TRUST_ALL_HTTPS", "0").strip().lower() in {"1","true","yes","on"}
 _BLOCKED_URL_HOSTS = frozenset({
     "localhost", "127.0.0.1", "0.0.0.0", "::1",
     "169.254.169.254", "metadata.google.internal",
@@ -106,6 +106,12 @@ def sanitize_url_for_logging(url):
 def _is_truthy(value):
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
+
+
+if _TRUSTED_URL_ALLOW_ALL_HTTPS:
+    logging.getLogger("bridge").warning(
+        "SSRF relaxed mode enabled via BRIDGE_TRUST_ALL_HTTPS=1; all public HTTPS hosts are allowed"
+    )
 
 def format_uptime(seconds):
     seconds = max(int(seconds or 0), 0)

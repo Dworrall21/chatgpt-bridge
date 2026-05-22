@@ -231,3 +231,12 @@ streaming robustness, and SSRF refinement is in Triage.
 | Chrome DevTools Protocol | 9222 |
 | Bridge HTTP | 11557 |
 | Bridge WS | 11558 |
+
+
+## Testing
+
+- Canonical quick check: `pytest -q`
+- Script-style integration checks (require a running bridge/Chrome session):
+  - `python3 tests/test_integration.py`
+  - `python3 tests/test_rate_limits.py`
+  - `python3 tests/test_model_catalog.py`
