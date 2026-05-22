@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-chatgpt-bridge-host.py — Local bridge between CLI tools and ChatGPT web.
+bridge-host.py — Local bridge between CLI tools and ChatGPT web.
 Uses aiohttp for reliable HTTP + WebSocket serving.
 
 Architecture (same pattern as the gemini bridge, extension-owned WebSocket):
