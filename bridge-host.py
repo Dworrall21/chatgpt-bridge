@@ -368,6 +368,39 @@ class BridgeState:
         self.save()
 
     @property
+    def conversation_sessions(self):
+        sessions = self._data.get("conversation_sessions")
+        return sessions if isinstance(sessions, dict) else {}
+
+    def get_conversation(self, session_key):
+        sessions = self.conversation_sessions
+        key = str(session_key or "default")
+        stored = sessions.get(key)
+        if isinstance(stored, dict):
+            return stored
+        if isinstance(stored, str):
+            return {"conversation_id": stored, "conversation_title": None}
+        return None
+
+    def set_conversation(self, session_key, conversation_id, conversation_title=None):
+        key = str(session_key or "default")
+        sessions = dict(self.conversation_sessions)
+        if conversation_id:
+            sessions[key] = {"conversation_id": conversation_id, "conversation_title": conversation_title}
+        else:
+            sessions.pop(key, None)
+        self._data["conversation_sessions"] = sessions
+        self.save()
+
+    def clear_conversation(self, session_key):
+        key = str(session_key or "default")
+        sessions = dict(self.conversation_sessions)
+        previous = sessions.pop(key, None)
+        self._data["conversation_sessions"] = sessions
+        self.save()
+        return previous
+
+    @property
     def available_models(self):
         return self._data.get("available_models", [])
 
@@ -475,6 +508,33 @@ def _catalog_payload(state):
         "object": "list",
         "data": _format_model_catalog(state.available_models, fetched_at),
     }
+
+
+def _conversation_session_key(body):
+    if not isinstance(body, dict):
+        return "default"
+    for key in ("session_id", "conversation_key", "hermes_session_id"):
+        value = body.get(key)
+        if value:
+            return str(value)
+    return "default"
+
+
+def _resolve_conversation_state(state, body):
+    session_key = _conversation_session_key(body)
+    wants_new = _is_truthy(body.get("new", False))
+    explicit_id = body.get("conversation_id") or None
+
+    if explicit_id:
+        return session_key, explicit_id, wants_new, True
+    if wants_new:
+        return session_key, None, True, False
+
+    stored = state.get_conversation(session_key)
+    if stored and stored.get("conversation_id"):
+        return session_key, stored.get("conversation_id"), False, False
+
+    return session_key, state.last_conversation_id or None, False, False
 
 
 # ─── Structured JSONLogging ───
@@ -718,8 +778,6 @@ async def main():
                         conv_title = msg.get("conversation_title")
                         if conv_id:
                             meta = {"conversation_id": conv_id, "conversation_title": conv_title}
-                            state.last_conversation_id = conv_id
-                            state.last_conversation_title = conv_title
                         debug_info = msg.get("_debug")
                         if debug_info:
                             meta["_debug"] = debug_info
@@ -943,7 +1001,9 @@ async def main():
         debug = _is_truthy(request.rel_url.query.get("debug") or body.get("debug", False))
         request_id = request.get("request_id")
         request_started_at = time.time()
-        conversation_id = body.get("conversation_id") or None
+        session_key, conversation_id, new_conversation, explicit_conversation = _resolve_conversation_state(state, body)
+        if new_conversation and not explicit_conversation:
+            state.clear_conversation(session_key)
         timeout_s = body.get("timeout", 10)
         if timeout_s > 600:
             timeout_s = 600
@@ -1082,11 +1142,17 @@ async def main():
 
         # non-streaming path
         pending[rid] = future = asyncio.get_event_loop().create_future()
+        pending_meta[rid] = {"session_key": session_key, "conversation_id": conversation_id, "conversation_title": None}
         try:
             result, ws_send_ms = await _send_and_wait(msg_data, timeout_s, rid, prompt_chars=prompt_chars, req_type="/v1/chat/completions")
             pending.pop(rid, None)
             meta = pending_meta.pop(rid, {})
             conv_id = meta.get("conversation_id"); conv_title = meta.get("conversation_title")
+            session_key_meta = meta.get("session_key") or session_key
+            if conv_id:
+                state.set_conversation(session_key_meta, conv_id, conv_title)
+                state.last_conversation_id = conv_id
+                state.last_conversation_title = conv_title
             successful_requests += 1; last_response_time = time.strftime("%H:%M:%S")
             _incr_assignee(assignee, "success")
             response_chars = len(result)
@@ -1133,8 +1199,29 @@ async def main():
             return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
         prompt = body.get("prompt", "").strip()
         options = body.get("options", {}); files = body.get("files", [])
+        messages = body.get("messages", [])
+        if isinstance(messages, list) and messages:
+            prompt_parts = []
+            for m in messages:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                if isinstance(content, list):
+                    text_parts = []
+                    for p in content:
+                        if p.get("type") == "text":
+                            text_parts.append(p.get("text", ""))
+                        elif p.get("type") == "image_url":
+                            url = p.get("image_url", {}).get("url", "")
+                            if url.startswith("file://"):
+                                url = url[7:]
+                            if url.startswith("/") or (len(url) > 1 and url[1] == ":"):
+                                files.append(url)
+                    content = " ".join(text_parts)
+                prompt_parts.append(f"{role}: {content}")
+            prompt = "
+".join(prompt_parts).strip()
         assignee = body.get("assignee") or ""
-        conversation_id = body.get("conversation_id") or state.last_conversation_id or None
+        session_key, conversation_id, new_conversation, explicit_conversation = _resolve_conversation_state(state, body)
         model_search = body.get("model_search") or None
         if model_search:
             try:
@@ -1155,6 +1242,8 @@ async def main():
         debug = _is_truthy(request.rel_url.query.get("debug") or body.get("debug", False))
         request_id = request.get("request_id")
         request_started_at = time.time()
+        if new_conversation and not explicit_conversation:
+            state.clear_conversation(session_key)
         timeout_s = body.get("timeout", 10)
         if timeout_s > 600: timeout_s = 600
         if not prompt and not files:
@@ -1201,6 +1290,7 @@ async def main():
                         "status": "started",
                         "code": "/chat"})
         pending[rid] = future = asyncio.get_event_loop().create_future()
+        pending_meta[rid] = {"session_key": session_key, "conversation_id": conversation_id, "conversation_title": None}
         msg_data = {"type": "prompt", "id": rid, "prompt": prompt,
                     "options": options, "files": [], "timeout": timeout_s,
                     "conversation_id": conversation_id, "model_search": model_search,
@@ -1210,6 +1300,11 @@ async def main():
             pending.pop(rid, None)
             meta = pending_meta.pop(rid, {})
             conv_id = meta.get("conversation_id"); conv_title = meta.get("conversation_title")
+            session_key_meta = meta.get("session_key") or session_key
+            if conv_id:
+                state.set_conversation(session_key_meta, conv_id, conv_title)
+                state.last_conversation_id = conv_id
+                state.last_conversation_title = conv_title
             successful_requests += 1; last_response_time = time.strftime("%H:%M:%S")
             _incr_assignee(assignee, "success")
             response_chars = len(result)
@@ -1324,6 +1419,26 @@ async def main():
                     log.warning("reload_send_error", extra={"error": str(e)})
         return web.json_response({"success": True, "message": "Reload sent to extensions"})
 
+    async def new_conversation(request):
+        """Explicitly reset the conversation pin — the next prompt starts a fresh ChatGPT thread."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        session_key = _conversation_session_key(body)
+        previous = state.clear_conversation(session_key)
+        if session_key == "default":
+            state.last_conversation_id = None
+            state.last_conversation_title = None
+        previous_id = previous.get("conversation_id") if isinstance(previous, dict) else previous
+        log.info("conversation_reset", extra={"rid": request.get("request_id"), "detail": previous_id})
+        return web.json_response({
+            "success": True,
+            "message": "Conversation pin reset — next prompt starts a fresh ChatGPT conversation",
+            "previous_conversation_id": previous_id,
+            "session_id": session_key,
+        })
+
     async def cors(request):
         return web.Response(headers={
             "Access-Control-Allow-Origin": "*",
@@ -1354,6 +1469,7 @@ async def main():
     app.router.add_get("/v1/models", models)
     app.router.add_get("/v1/cdp/status", cdp_status)
     app.router.add_post("/reload", reload_ext)
+    app.router.add_post("/new", new_conversation)
     app.router.add_post("/chat", chat)
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_options("/v1/chat/completions", cors)

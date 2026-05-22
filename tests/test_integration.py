@@ -351,6 +351,80 @@ def main() -> int:
     if not ok4:
         return 1
 
+    print("\n=== Test 4b: Auto-pinning (no explicit conversation_id) ===")
+    # Send two prompts WITHOUT conversation_id — the bridge should auto-pin to
+    # the same ChatGPT thread via state.last_conversation_id.
+    first = request_json_retry(
+        "POST",
+        "/v1/chat/completions",
+        body={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Say hello in exactly one short sentence."}],
+            "timeout": LONG_TIMEOUT,
+        },
+        timeout=LONG_TIMEOUT + 30,
+    )
+    first_body = first.body if isinstance(first.body, dict) else {}
+    first_conv = first_body.get("conversation_id")
+    first_choices = first_body.get("choices") if isinstance(first_body, dict) else None
+    first_text = first_choices[0].get("message", {}).get("content", "") if isinstance(first_choices, list) and first_choices else ""
+
+    second = request_json_retry(
+        "POST",
+        "/v1/chat/completions",
+        body={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "What was my previous request to you? Answer concisely."}],
+            "timeout": LONG_TIMEOUT,
+        },
+        timeout=LONG_TIMEOUT + 30,
+    )
+    second_body = second.body if isinstance(second.body, dict) else {}
+    second_conv = second_body.get("conversation_id")
+
+    ok4b = bool(
+        first.status == 200
+        and second.status == 200
+        and isinstance(first_conv, str)
+        and isinstance(second_conv, str)
+        and first_conv == second_conv
+    )
+    record(
+        "auto-pin same conversation",
+        ok4b,
+        f"first_conv={first_conv!r}, second_conv={second_conv!r}, first_text={first_text!r}",
+    )
+    if not ok4b:
+        return 1
+
+    print("\n=== Test 4c: new:true starts a fresh conversation ===")
+    fresh = request_json_retry(
+        "POST",
+        "/v1/chat/completions",
+        body={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Say hello in exactly one short sentence."}],
+            "new": True,
+            "timeout": LONG_TIMEOUT,
+        },
+        timeout=LONG_TIMEOUT + 30,
+    )
+    fresh_body = fresh.body if isinstance(fresh.body, dict) else {}
+    fresh_conv = fresh_body.get("conversation_id")
+
+    ok4c = bool(
+        fresh.status == 200
+        and isinstance(fresh_conv, str)
+        and fresh_conv != second_conv  # must be a DIFFERENT conversation
+    )
+    record(
+        "new:true fresh conversation",
+        ok4c,
+        f"prev_conv={second_conv!r}, fresh_conv={fresh_conv!r}",
+    )
+    if not ok4c:
+        return 1
+
     print("\n=== Test 5: Model selection (model_search parameter) ===")
     model_prompt = "Write one short, vivid sentence about a bridge crossing a stormy river."
     plain = request_json_retry(

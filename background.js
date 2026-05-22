@@ -415,7 +415,29 @@ async function handleBridgePrompt(data) {
       throw new Error("No ChatGPT tab found. Open https://chatgpt.com/ in the debug Chrome profile.");
     }
 
-    // Ensure content script is present before sending.
+    // ── Navigate to the target conversation BEFORE sending to content script ──
+    // Using location.href inside the content script kills it and requires a slow
+    // retry cycle. Instead, navigate the tab here and wait for it to finish loading.
+    const needNavigate = !!data.conversation_id && tab.url && !tab.url.includes(`/c/${data.conversation_id}`);
+    if (needNavigate) {
+      console.log(`[ChatGPT Bridge] navigating tab ${tab.id} to /c/${data.conversation_id}`);
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("Navigation timed out")), 15000);
+        const listener = (changedTabId, changeInfo) => {
+          if (changedTabId === tab.id && changeInfo.status === "complete") {
+            chrome.tabs.onUpdated.removeListener(listener);
+            clearTimeout(timeout);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+        chrome.tabs.update(tab.id, { url: `https://chatgpt.com/c/${data.conversation_id}` });
+      });
+      // Small delay for content script injection after navigation
+      await sleep(500);
+    }
+
+    // Ensure content script is present before sending (handles fresh navigation too)
     await injectIfMissing(tab, "send-miss");
 
     let lastError = null;

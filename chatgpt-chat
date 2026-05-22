@@ -8,6 +8,9 @@
 #   chatgpt-chat --model-search "thinking" "deep analysis prompt"
 #   chatgpt-chat -m o3 "complex reasoning prompt"
 #   chatgpt-chat --conversation-id UUID "follow-up prompt"
+#   chatgpt-chat --session-id KEY "follow-up prompt"
+#   chatgpt-chat --messages-json history.json "final user turn"
+#   chatgpt-chat --new "start fresh"
 #   chatgpt-chat --health
 #   chatgpt-chat --reload
 
@@ -20,6 +23,9 @@ HOST_SCRIPT="$HOME/chatgpt-extension/bridge-host.py"
 TIMEOUT=10
 CONVERSATION_ID=""
 MODEL_SEARCH=""
+SESSION_ID="${HERMES_SESSION_ID:-}"
+MESSAGES_JSON=""
+RESET_ONLY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --timeout|-T)
@@ -33,6 +39,18 @@ while [[ $# -gt 0 ]]; do
     --conversation-id|-c)
       CONVERSATION_ID="${2:?missing value for --conversation-id}"
       shift 2
+      ;;
+    --session-id|-s)
+      SESSION_ID="${2:?missing value for --session-id}"
+      shift 2
+      ;;
+    --messages-json)
+      MESSAGES_JSON="${2:?missing value for --messages-json}"
+      shift 2
+      ;;
+    --new)
+      RESET_ONLY=1
+      shift
       ;;
     *)
       break
@@ -51,7 +69,7 @@ case "${1:-}" in
     ;;
   --help|-h)
     cat <<USAGE
-Usage: chatgpt-chat [--timeout N] [--model-search TERM] [--conversation-id UUID] ["prompt" | --file PATH | stdin]
+Usage: chatgpt-chat [--timeout N] [--model-search TERM] [--conversation-id UUID] [--session-id KEY] [--messages-json PATH] [--new] ["prompt" | --file PATH | stdin]
   "prompt"               Send a prompt string
   --file PATH            Send contents of a file as the prompt
   --timeout N            Set timeout in seconds (default: 10)
@@ -59,6 +77,10 @@ Usage: chatgpt-chat [--timeout N] [--model-search TERM] [--conversation-id UUID]
   -m TERM                Shorthand for --model-search
   --conversation-id UUID Continue an existing conversation
   -c UUID                Shorthand for --conversation-id
+  --session-id KEY       Scope the ChatGPT conversation pin to a Hermes session key
+  -s KEY                 Shorthand for --session-id
+  --messages-json PATH   Send OpenAI-style messages from a JSON file (context bundle)
+  --new                  Reset the pinned ChatGPT conversation before sending
   --health               Check bridge status
   --reload               Reload extension + ChatGPT tab
   -h / --help            Show this help
@@ -96,9 +118,11 @@ USAGE
     ;;
 esac
 
-if [[ -z "${PROMPT:-}" ]]; then
-  echo "Error: empty prompt" >&2
-  exit 1
+if [[ -z "${PROMPT:-}" && -z "${MESSAGES_JSON:-}" ]]; then
+  if [[ "$RESET_ONLY" -eq 0 ]]; then
+    echo "Error: empty prompt" >&2
+    exit 1
+  fi
 fi
 
 # Validate --timeout is a positive integer
@@ -107,27 +131,61 @@ if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || [[ "$TIMEOUT" -le 0 ]]; then
   exit 1
 fi
 
+if [[ "$RESET_ONLY" -eq 1 ]]; then
+  python3 - "$SESSION_ID" <<'PY'
+import json, sys, subprocess
+session_id = sys.argv[1] or None
+payload = {"session_id": session_id} if session_id else {}
+r = subprocess.run([
+    "curl", "-s", "-X", "POST", "http://127.0.0.1:11557/new",
+    "-H", "Content-Type: application/json",
+    "-d", json.dumps(payload),
+], capture_output=True, text=True)
+if r.stdout.strip():
+    print(r.stdout.strip())
+if r.returncode != 0:
+    print(r.stderr.strip(), file=sys.stderr)
+    sys.exit(r.returncode)
+PY
+  [[ -z "${PROMPT:-}" && -z "${MESSAGES_JSON:-}" ]] && exit 0
+fi
+
 # Send prompt to bridge, parse JSON response
 CURL_TIMEOUT=$(( TIMEOUT + 30 ))
 
-# Build the payload, including conversation_id and model_search if set
-echo "$PROMPT" | python3 -c "
-import sys, json, subprocess
+# Build the payload, including conversation/session ids and model_search if set
+export PROMPT TIMEOUT CONVERSATION_ID MODEL_SEARCH SESSION_ID MESSAGES_JSON CURL_TIMEOUT
+python3 - <<'PY'
+import json, os, subprocess, sys
+from pathlib import Path
 
-prompt = sys.stdin.read()
-timeout = $TIMEOUT
-conversation_id = '$CONVERSATION_ID' or None
-model_search = '$MODEL_SEARCH' or None
+prompt = os.environ.get('PROMPT', '')
+timeout = int(os.environ['TIMEOUT'])
+conversation_id = os.environ.get('CONVERSATION_ID') or None
+model_search = os.environ.get('MODEL_SEARCH') or None
+session_id = os.environ.get('SESSION_ID') or None
+messages_json = os.environ.get('MESSAGES_JSON') or None
+curl_timeout = os.environ['CURL_TIMEOUT']
 
-payload_dict = {'prompt': prompt, 'timeout': timeout}
+payload_dict = {'timeout': timeout}
+if session_id:
+    payload_dict['session_id'] = session_id
 if conversation_id:
     payload_dict['conversation_id'] = conversation_id
 if model_search:
     payload_dict['model_search'] = model_search
 
+if messages_json:
+    messages_path = Path(messages_json)
+    payload_dict['messages'] = json.loads(messages_path.read_text())
+    if prompt:
+        payload_dict['messages'].append({'role': 'user', 'content': prompt})
+else:
+    payload_dict['prompt'] = prompt
+
 payload = json.dumps(payload_dict)
 result = subprocess.run([
-    'curl', '-s', '--max-time', '$CURL_TIMEOUT',
+    'curl', '-s', '--max-time', curl_timeout,
     '-X', 'POST', 'http://127.0.0.1:11557/chat',
     '-H', 'Content-Type: application/json',
     '-d', payload,
@@ -154,4 +212,4 @@ if data.get('success'):
 else:
     print('Error:', data.get('error', 'unknown'), file=sys.stderr)
     sys.exit(1)
-"
+PY
