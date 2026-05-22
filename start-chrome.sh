@@ -13,6 +13,9 @@ CDP_PORT="${CDP_PORT:-9222}"
 HEADLESS="${HEADLESS:-}"
 START_BRIDGE=1
 
+# ── Clean __pycache__ before anything else (Chrome rejects dirs starting with _)
+rm -rf "${HOME}/chatgpt-extension/__pycache__" 2>/dev/null || true
+
 for arg in "$@"; do
     case "$arg" in
         --headless) HEADLESS="--headless=new" ;;

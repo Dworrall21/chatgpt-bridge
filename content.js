@@ -47,13 +47,29 @@
   // ── Message relay to background.js ─────────────────────────────────────
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === "prompt") {
-      handlePrompt(msg.prompt, msg.timeout, msg.attempt || 0, msg.conversation_id || null, msg.model_search || null, msg.stream || false, msg.id || "")
-        .then(text => sendResponse({
+      handlePrompt(
+        msg.prompt,
+        msg.timeout,
+        msg.attempt || 0,
+        msg.conversation_id || null,
+        msg.model_search || null,
+        msg.stream || false,
+        msg.id || "",
+        !!msg.debug,
+      )
+        .then((result) => sendResponse({
           success: true,
-          text,
+          text: result.text,
           conversation_id: extractConversationId(),
           conversation_title: extractConversationTitle(),
+          _debug: result._debug || null,
         }))
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true;
+    }
+    if (msg.action === "enumerate_models") {
+      enumerateAvailableModels()
+        .then(models => sendResponse({ success: true, models }))
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true;
     }
@@ -63,12 +79,140 @@
     }
   });
 
-  // ── Model Selection ───────────────────────────────────────────────────
-  // Opens ChatGPT's model picker (Radix menu), searches for a model, and
-  // clicks the first matching item that isn't "Use Thinking" or "Search the web".
-  // Silent fallback — if anything goes wrong, we just stay on the current model.
+  // ── Model Selection / Model Catalog ───────────────────────────────────
+  // Opens ChatGPT's model picker, enumerates menu items, and selects the best
+  // match for a search term. The same picker scan is reused for model catalog
+  // enumeration when the bridge asks for available models.
 
-  const MODEL_SWITCH_BTN = 'button[aria-label="Switch model"]';
+  const MODEL_SKIP_LABELS = ['use thinking', 'search the web'];
+  const MODEL_PICKER_SELECTORS = [
+    'button[aria-label="Switch model"]',
+    'button[title="Switch model"]',
+    'button[aria-label*="model"]',
+    'button[title*="model"]',
+    '[role="button"][aria-label*="model"]',
+  ];
+
+  function normalizeModelText(text) {
+    return String(text || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function findSwitchModelButton() {
+    const candidates = [];
+    for (const selector of MODEL_PICKER_SELECTORS) {
+      for (const el of document.querySelectorAll(selector)) {
+        candidates.push(el);
+      }
+    }
+    for (const el of candidates) {
+      const label = [el.getAttribute('aria-label'), el.getAttribute('title'), el.textContent]
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+      const norm = normalizeModelText(label);
+      if (!norm) continue;
+      if (norm.includes('switch model') || (norm.includes('model') && norm.includes('switch'))) {
+        return el;
+      }
+    }
+    return null;
+  }
+
+  async function waitForSwitchModelButton(timeoutMs = 8000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const button = findSwitchModelButton();
+      if (button) return button;
+      await sleep(250);
+    }
+    return null;
+  }
+
+  function collectMenuItems(menuEl) {
+    if (!menuEl) return [];
+    const nodes = menuEl.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"]');
+    const labels = [];
+    const seen = new Set();
+    for (const item of nodes) {
+      const label = (item.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!label) continue;
+      const norm = normalizeModelText(label);
+      if (!norm) continue;
+      if (MODEL_SKIP_LABELS.some(skip => norm.includes(skip))) continue;
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      labels.push(label);
+    }
+    return labels;
+  }
+
+  function scoreModelMatch(searchTerm, label) {
+    const search = normalizeModelText(searchTerm);
+    const candidate = normalizeModelText(label);
+    if (!search || !candidate) return null;
+    if (candidate === search) return [0, candidate.length, label];
+    if (candidate.startsWith(search)) return [1, candidate.length, label];
+    if (candidate.includes(search)) return [2, candidate.length, label];
+    const tokens = search.split(' ').filter(Boolean);
+    if (tokens.length && tokens.every(tok => candidate.includes(tok))) return [3, candidate.length, label];
+    return null;
+  }
+
+  async function openModelPicker() {
+    const switchBtn = await waitForSwitchModelButton();
+    if (!switchBtn) {
+      console.warn('[ChatGPT Bridge] model picker: no Switch model button found');
+      return null;
+    }
+
+    switchBtn.scrollIntoView({ block: 'center' });
+    switchBtn.focus();
+    await sleep(150);
+
+    // Some ChatGPT builds only react to a real-looking pointer sequence.
+    switchBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+    switchBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0 }));
+    switchBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, button: 0 }));
+    switchBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+    if (typeof switchBtn.click === 'function') {
+      switchBtn.click();
+    }
+
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const menuEl = document.querySelector('[role="menu"], [role="listbox"], [role="dialog"]');
+      if (menuEl) return menuEl;
+      await sleep(200);
+    }
+
+    console.warn('[ChatGPT Bridge] model picker: menu did not open');
+    return null;
+  }
+
+  async function closeModelPicker() {
+    try {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    } catch (_) {}
+    await sleep(150);
+  }
+
+  async function enumerateAvailableModels() {
+    try {
+      const menuEl = await openModelPicker();
+      if (!menuEl) return [];
+      const labels = collectMenuItems(menuEl);
+      await closeModelPicker();
+      return labels;
+    } catch (err) {
+      console.warn('[ChatGPT Bridge] enumerateAvailableModels error:', err.message || err);
+      await closeModelPicker();
+      return [];
+    }
+  }
 
   async function selectModel(searchTerm) {
     if (!searchTerm || typeof searchTerm !== 'string') return;
@@ -76,69 +220,57 @@
     if (!searchTerm) return;
 
     try {
-      // 1. Find and click the "Switch model" button
-      const switchBtn = document.querySelector(MODEL_SWITCH_BTN);
-      if (!switchBtn) {
-        console.warn('[ChatGPT Bridge] selectModel: no Switch model button found');
-        return;
-      }
-      switchBtn.scrollIntoView({ block: 'center' });
-      await sleep(100);
-      switchBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-      switchBtn.click();
-      await sleep(600);
+      const menuEl = await openModelPicker();
+      if (!menuEl) return;
 
-      // 2. Find the search input inside the opened menu
-      const menuEl = document.querySelector('[role="menu"]');
-      if (!menuEl) {
-        console.warn('[ChatGPT Bridge] selectModel: menu did not open');
-        return;
-      }
       const searchInput = menuEl.querySelector('input');
-      if (!searchInput) {
-        console.warn('[ChatGPT Bridge] selectModel: no search input in menu');
-        // Close the menu by pressing Escape
-        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      if (searchInput) {
+        searchInput.focus();
+        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, 'value'
+        ).set;
+        nativeInputValueSetter.call(searchInput, searchTerm);
+        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+        searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+        await sleep(600);
+      }
+
+      const labels = collectMenuItems(menuEl);
+      const ranked = labels
+        .map((label, idx) => ({ label, idx, score: scoreModelMatch(searchTerm, label) }))
+        .filter(item => item.score)
+        .sort((a, b) => {
+          const sa = a.score;
+          const sb = b.score;
+          for (let i = 0; i < sa.length; i++) {
+            if (sa[i] < sb[i]) return -1;
+            if (sa[i] > sb[i]) return 1;
+          }
+          return a.idx - b.idx;
+        });
+
+      const targetLabel = ranked.length ? ranked[0].label : null;
+      if (!targetLabel) {
+        console.warn(`[ChatGPT Bridge] selectModel: no matching model for "${searchTerm}"`);
+        await closeModelPicker();
         return;
       }
 
-      // 3. Type the search term using the native value setter (handles React)
-      searchInput.focus();
-      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-        window.HTMLInputElement.prototype, 'value'
-      ).set;
-      nativeInputValueSetter.call(searchInput, searchTerm);
-      searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-      searchInput.dispatchEvent(new Event('change', { bubbles: true }));
-      await sleep(500);
-
-      // 4. Find first valid menuitem — skip "Use Thinking" and "Search the web"
-      const items = menuEl.querySelectorAll('[role="menuitem"]');
-      const skipLabels = ['use thinking', 'search the web'];
-      let target = null;
-      for (const item of items) {
-        const label = (item.textContent || '').trim().toLowerCase();
-        if (skipLabels.some(skip => label.includes(skip))) continue;
-        target = item;
-        break;
-      }
-
-      if (target) {
-        target.scrollIntoView({ block: 'nearest' });
+      const targetItem = Array.from(menuEl.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"]'))
+        .find(item => (item.textContent || '').replace(/\s+/g, ' ').trim() === targetLabel);
+      if (targetItem) {
+        targetItem.scrollIntoView({ block: 'nearest' });
         await sleep(100);
-        target.click();
-        console.log(`[ChatGPT Bridge] selectModel: selected "${target.textContent.trim()}" for search "${searchTerm}"`);
+        targetItem.click();
+        console.log(`[ChatGPT Bridge] selectModel: selected "${targetLabel}" for search "${searchTerm}"`);
         await sleep(300);
       } else {
-        console.warn(`[ChatGPT Bridge] selectModel: no matching model for "${searchTerm}", staying on current model`);
-        // Close the menu
-        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-        await sleep(200);
+        console.warn(`[ChatGPT Bridge] selectModel: target "${targetLabel}" disappeared before click`);
+        await closeModelPicker();
       }
     } catch (err) {
       console.warn('[ChatGPT Bridge] selectModel error:', err.message || err);
-      // Ensure any open menu is closed
-      try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); } catch (_) {}
+      await closeModelPicker();
     }
   }
 
@@ -215,7 +347,7 @@
     return null;
   }
 
-  async function handlePrompt(prompt, timeoutSeconds = 10, attempt = 0, conversationId = null, modelSearch = null, stream = false, requestId = "") {
+  async function handlePrompt(prompt, timeoutSeconds = 10, attempt = 0, conversationId = null, modelSearch = null, stream = false, requestId = "", debug = false) {
     const timeout = Number(timeoutSeconds || 10);
 
     for (let loop = attempt; loop < 2; loop++) {
@@ -287,11 +419,11 @@
       }
 
       try {
-        const text = await waitForResponse(timeout, assistantCountBefore, loop, { stream, requestId });
+        const result = await waitForResponse(timeout, assistantCountBefore, loop, { stream, requestId, debug });
         if (stream && requestId) {
           sendDone(requestId);
         }
-        return text;
+        return result;
       } catch (err) {
         const msg = err?.message || String(err);
         if (!/empty after 10s|did not generate a response/i.test(msg) || loop === 1) {
@@ -366,11 +498,15 @@
   }
 
   async function waitForResponse(timeoutSeconds = 10, assistantCountBefore = 0, attempt = 0, options = {}) {
-    const { stream = false, requestId = "" } = options;
+    const { stream = false, requestId = "", debug = false } = options;
     const maxWait = Math.min(Math.max(timeoutSeconds, 1), 600) * 1000;
     const pollMs = stream ? 200 : 500;   // Faster polling when streaming for lower latency
+    const startTs = performance.now();
+    let lastPollAt = startTs;
     let elapsed = 0, lastText = "", stableCount = 0;
     let lastDeltaSent = "";  // Track last text sent as delta to avoid duplicates
+    let pollCount = 0;
+    const pollIntervalsMs = [];
     const EMPTY_CHECK_MS = 10_000;
     let emptyChecked = false;
 
@@ -381,12 +517,39 @@
 
     while (elapsed < maxWait) {
       await sleep(pollMs);
-      elapsed += pollMs;
+      const now = performance.now();
+      const intervalMs = Math.max(0, Math.round(now - lastPollAt));
+      lastPollAt = now;
+      elapsed = Math.round(now - startTs);
+      pollCount += 1;
+      pollIntervalsMs.push(intervalMs);
+
       const assistants = document.querySelectorAll('[data-message-author-role="assistant"]');
       const text = extractLatestResponse();
 
       // Only accept responses from NEW assistant elements created after we sent the prompt
       const newAssistantArrived = assistants.length > assistantCountBefore;
+      const textChanged = text !== lastText;
+
+      if (debug && requestId) {
+        try {
+          chrome.runtime.sendMessage({
+            action: "poll",
+            id: requestId,
+            poll: {
+              interval_ms: intervalMs,
+              poll_index: pollCount,
+              text_changed: textChanged,
+              assistant_count: assistants.length,
+              generating: isGenerating(),
+              text_length: text ? text.length : 0,
+              stable_count: stableCount,
+            },
+          }, () => void chrome.runtime.lastError);
+        } catch (_) {
+          // Debug logging is best-effort only.
+        }
+      }
 
       if (text && text.length > 3 && newAssistantArrived && !isNoise(text)) {
         // Stream intermediate text to background.js
@@ -397,7 +560,17 @@
 
         if (text === lastText) {
           stableCount++;
-          if (stableCount >= 3) return text;
+          if (stableCount >= 3) {
+            return {
+              text,
+              _debug: debug ? {
+                elapsed_ms: Math.round(performance.now() - startTs),
+                ws_send_ms: null,
+                poll_count: pollCount,
+                poll_intervals_ms: pollIntervalsMs,
+              } : null,
+            };
+          }
         } else {
           stableCount = 0;
           lastText = text;
@@ -410,7 +583,17 @@
           lastDeltaSent = lastText;
         }
         stableCount++;
-        if (stableCount >= 3) return lastText;
+        if (stableCount >= 3) {
+          return {
+            text: lastText,
+            _debug: debug ? {
+              elapsed_ms: Math.round(performance.now() - startTs),
+              ws_send_ms: null,
+              poll_count: pollCount,
+              poll_intervals_ms: pollIntervalsMs,
+            } : null,
+          };
+        }
       }
 
       // ── Empty container detection (10 s mark) ────────────────────────────
@@ -423,7 +606,17 @@
         }
       }
     }
-    if (lastText) return lastText + "\n\n[WARNING: timed out]";
+    if (lastText) {
+      return {
+        text: lastText + "\n\n[WARNING: timed out]",
+        _debug: debug ? {
+          elapsed_ms: Math.round(performance.now() - startTs),
+          ws_send_ms: null,
+          poll_count: pollCount,
+          poll_intervals_ms: pollIntervalsMs,
+        } : null,
+      };
+    }
     throw new Error("ChatGPT did not generate a response after 2 attempts");
   }
 

@@ -24,10 +24,15 @@ import signal
 import traceback
 import time
 import os
+import uuid
+import math
 import re
 import mimetypes
+from collections import defaultdict, deque
 from pathlib import Path
 from urllib.parse import urlparse
+
+from aiohttp import web
 
 HTTP_PORT = 11557
 WS_PORT   = 11558
@@ -98,6 +103,75 @@ def sanitize_url_for_logging(url):
         return "<invalid url>"
 
 
+def _is_truthy(value):
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def format_uptime(seconds):
+    seconds = max(int(seconds or 0), 0)
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    return f"{hours}h {minutes}m"
+
+
+_MODEL_CATALOG_CANDIDATES = [
+    Path("/home/david/.hermes/cache/model_catalog.json"),
+    Path.home() / ".hermes" / "cache" / "model_catalog.json",
+    Path.home() / ".hermes" / "chatgpt_bridge_state" / "model_catalog.json",
+    Path.home() / ".hermes" / "chatgpt_bridge_state" / "models.json",
+]
+
+
+def load_available_models():
+    for path in _MODEL_CATALOG_CANDIDATES:
+        try:
+            if not path.exists():
+                continue
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+
+        available = []
+        providers = data.get("providers", {}) if isinstance(data, dict) else {}
+        if isinstance(providers, dict):
+            for provider_data in providers.values():
+                if not isinstance(provider_data, dict):
+                    continue
+                for model in provider_data.get("models", []) or []:
+                    if isinstance(model, dict):
+                        model_id = model.get("id") or model.get("model")
+                    else:
+                        model_id = model
+                    if model_id:
+                        available.append(str(model_id))
+        elif isinstance(data, dict):
+            raw_models = data.get("available") or data.get("models") or []
+            for model in raw_models:
+                if isinstance(model, dict):
+                    model_id = model.get("id") or model.get("model")
+                else:
+                    model_id = model
+                if model_id:
+                    available.append(str(model_id))
+
+        if available:
+            return sorted(dict.fromkeys(available))
+    return []
+
+
+def summarize_watchdog_events(events):
+    events = list(events or [])
+    last = events[-1] if events else None
+    if not isinstance(last, dict):
+        last = {}
+    return {
+        "recovery_events": len(events),
+        "last_recovery": last.get("ts"),
+        "chrome_alive": bool(last.get("chrome_alive", False)),
+        "events": events[-5:],
+    }
+
+
 # ─── Atomic file writes ───
 def atomic_write(path, content):
     p = Path(path)
@@ -115,6 +189,92 @@ def atomic_write(path, content):
         except OSError:
             pass
         raise
+
+
+def _env_int(name: str, default: int, *, min_value: int | None = None) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    if min_value is not None and value < min_value:
+        value = min_value
+    return value
+
+
+def _client_ip(request) -> str:
+    remote = getattr(request, "remote", None)
+    if remote:
+        return str(remote)
+    transport = getattr(request, "transport", None)
+    if transport is not None:
+        peer = transport.get_extra_info("peername")
+        if isinstance(peer, (tuple, list)) and peer:
+            return str(peer[0])
+        if isinstance(peer, str) and peer:
+            return peer
+    return "unknown"
+
+
+class SlidingWindowRateLimiter:
+    def __init__(self, limit: int, window_seconds: int = 60):
+        self.limit = max(0, int(limit))
+        self.window_seconds = int(window_seconds)
+        self._hits = defaultdict(deque)
+        self._lock = asyncio.Lock()
+
+    async def allow(self, key: str, now: float | None = None):
+        if self.limit <= 0:
+            return True, None, 0
+        if now is None:
+            now = time.monotonic()
+        async with self._lock:
+            hits = self._hits[key]
+            cutoff = now - self.window_seconds
+            while hits and hits[0] <= cutoff:
+                hits.popleft()
+            if len(hits) >= self.limit:
+                retry_after = max(1, math.ceil(self.window_seconds - (now - hits[0])))
+                return False, retry_after, len(hits)
+            hits.append(now)
+            return True, None, len(hits)
+
+
+def make_request_gate(max_concurrent: int, rate_limit: int, window_seconds: int = 60):
+    semaphore = asyncio.Semaphore(max(1, int(max_concurrent)))
+    limiter = SlidingWindowRateLimiter(rate_limit, window_seconds)
+
+    @web.middleware
+    async def request_gate(request, handler):
+        if request.method == "OPTIONS":
+            return await handler(request)
+
+        if request.path in {"/chat", "/v1/chat/completions"}:
+            ip = _client_ip(request)
+            allowed, retry_after, count = await limiter.allow(ip)
+            if not allowed:
+                log.warning("rate_limited", extra={"method": request.method, "path": request.path,
+                                                     "detail": ip, "count": count})
+                headers = {"Retry-After": str(retry_after), "Access-Control-Allow-Origin": "*"}
+                if request.path == "/v1/chat/completions":
+                    return web.json_response(
+                        {"error": {"message": "Rate limit exceeded", "type": "rate_limit_exceeded"}},
+                        status=429,
+                        headers=headers,
+                    )
+                return web.json_response({"success": False, "error": "Rate limit exceeded"}, status=429, headers=headers)
+
+            async with semaphore:
+                hook = globals().get("bridge_test_hook")
+                if hook is not None:
+                    maybe = hook(request)
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
+                return await handler(request)
+
+        return await handler(request)
+
+    return request_gate, semaphore, limiter
 
 
 # ─── Persistent bridge state ───
@@ -166,6 +326,115 @@ class BridgeState:
         self._data["last_conversation_title"] = value
         self.save()
 
+    @property
+    def available_models(self):
+        return self._data.get("available_models", [])
+
+    @available_models.setter
+    def available_models(self, value):
+        self._data["available_models"] = value
+        self.save()
+
+    @property
+    def available_models_fetched_at(self):
+        return self._data.get("available_models_fetched_at", 0)
+
+    @available_models_fetched_at.setter
+    def available_models_fetched_at(self, value):
+        self._data["available_models_fetched_at"] = int(value or 0)
+        self.save()
+
+
+MODEL_CATALOG_TTL_SECONDS = 24 * 60 * 60
+
+
+def _normalize_model_text(text):
+    text = (text or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _compact_model_text(text):
+    return re.sub(r"[^a-z0-9]+", "", (text or "").strip().lower())
+
+
+def _unique_model_labels(labels):
+    seen = set()
+    out = []
+    for label in labels or []:
+        label = " ".join(str(label).split()).strip()
+        if not label:
+            continue
+        norm = _normalize_model_text(label)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(label)
+    return out
+
+
+def _model_id_from_label(label):
+    norm = _normalize_model_text(label)
+    if not norm:
+        return "unknown-model"
+    return re.sub(r"[^a-z0-9]+", "-", norm).strip("-") or "unknown-model"
+
+
+def _format_model_catalog(labels, fetched_at=None):
+    fetched_at = int(fetched_at or time.time())
+    return [{
+        "id": _model_id_from_label(label),
+        "object": "model",
+        "created": fetched_at,
+        "owned_by": "openai",
+    } for label in _unique_model_labels(labels)]
+
+
+def _best_model_match(search_term, labels):
+    search_norm = _normalize_model_text(search_term)
+    search_compact = _compact_model_text(search_term)
+    if not search_norm and not search_compact:
+        return None
+
+    search_tokens = [tok for tok in search_norm.split(" ") if tok]
+    best = None
+    best_score = None
+    for idx, label in enumerate(_unique_model_labels(labels)):
+        label_norm = _normalize_model_text(label)
+        label_compact = _compact_model_text(label)
+        if not label_norm and not label_compact:
+            continue
+        score = None
+        if label_norm == search_norm or label_compact == search_compact:
+            score = (0, len(label_compact) or len(label_norm), idx)
+        elif label_norm.startswith(search_norm) or label_compact.startswith(search_compact):
+            score = (1, len(label_compact) or len(label_norm), idx)
+        elif search_norm in label_norm or search_compact in label_compact:
+            score = (2, len(label_compact) or len(label_norm), idx)
+        elif search_tokens and all(tok in label_norm for tok in search_tokens):
+            score = (3, len(label_compact) or len(label_norm), idx)
+        if score is None:
+            continue
+        if best_score is None or score < best_score:
+            best_score = score
+            best = label
+    return best
+
+
+def _catalog_is_stale(state):
+    fetched_at = int(state.available_models_fetched_at or 0)
+    if not fetched_at:
+        return True
+    return (time.time() - fetched_at) >= MODEL_CATALOG_TTL_SECONDS
+
+
+def _catalog_payload(state):
+    fetched_at = int(state.available_models_fetched_at or 0)
+    return {
+        "object": "list",
+        "data": _format_model_catalog(state.available_models, fetched_at),
+    }
+
 
 # ─── Structured JSONLogging ───
 
@@ -181,7 +450,7 @@ class _JsonLinesFormatter(logging.Formatter):
             "level": record.levelname,
         }
         # structured extra fields from extra={...}
-        for k in ("event", "rid", "assignee", "method", "status",
+        for k in ("event", "rid", "request_id", "type", "assignee", "method", "status",
                    "prompt_chars", "response_chars", "elapsed_ms",
                    "error", "code", "count", "detail", "reason",
                    "duration_s", "queue_len", "qc"):
@@ -196,10 +465,10 @@ def _setup_logging(level_name: str = "WARNING"):
     """Configure root logger: structured JSONLines to stderr."""
     root = logging.getLogger()
     root.setLevel(_LEVEL_NAMES.get(level_name.upper(), logging.WARNING))
-    if not root.handlers:
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(_JsonLinesFormatter())
-        root.addHandler(handler)
+    root.handlers.clear()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_JsonLinesFormatter())
+    root.addHandler(handler)
     return root
 
 
@@ -220,6 +489,7 @@ last_response_time: str | None
 # Additional per-request-type counters + queue depths
 per_assignee_requests: dict  # assignee -> dict(total, success, timeout, error)
 watchdog_events: list        # last up to 20 {event, tabId, detail, ts}
+bridge_test_hook = None
 
 
 def _find_chatgpt_tab_cdp():
@@ -360,19 +630,37 @@ async def main():
     pending = {}           # rid -> asyncio.Future
     pending_meta = {}      # rid -> {conversation_id, conversation_title}
     stream_queues = {}     # rid -> asyncio.Queue (SSE streaming)
+    model_catalog_pending = {}  # rid -> asyncio.Future for model catalog responses
+    model_catalog_refresh_lock = asyncio.Lock()
     counter = 0
     ws_lock = asyncio.Lock()
+    extension_connected_since = None
 
     per_assignee_requests = {}  # assignee -> {total, success, timeout, error}
     watchdog_events = []       # last 20 watchdog recovery event dicts
+    watchdog_status = None
 
     state = BridgeState()
+    if not state.available_models:
+        cached_models = load_available_models()
+        if cached_models:
+            state.available_models = cached_models
+            state.available_models_fetched_at = int(time.time())
+            log.info("model_catalog_seeded", extra={"count": len(cached_models)})
     log.info("state_loaded", extra={"queue_len": state.last_conversation_id})
+
+    max_concurrent = _env_int("BRIDGE_MAX_CONCURRENT", 3, min_value=1)
+    rate_limit = _env_int("BRIDGE_RATE_LIMIT", 10, min_value=0)
+    request_gate, request_semaphore, rate_limiter = make_request_gate(max_concurrent, rate_limit)
+    log.info("request_controls_ready", extra={"count": max_concurrent, "detail": rate_limit})
 
     # ─── WebSocket handler ──────────────────────────────────────────────────
 
     async def ws_handler(ws):
+        nonlocal extension_connected_since, watchdog_status
         connected_extensions.add(ws)
+        if extension_connected_since is None:
+            extension_connected_since = time.time()
         log.info("extension_connected", extra={"queue_len": len(connected_extensions)})
         try:
             async for raw in ws:
@@ -391,9 +679,18 @@ async def main():
                             meta = {"conversation_id": conv_id, "conversation_title": conv_title}
                             state.last_conversation_id = conv_id
                             state.last_conversation_title = conv_title
+                        debug_info = msg.get("_debug")
+                        if debug_info:
+                            meta["_debug"] = debug_info
                         pending_meta[rid] = meta
                         pending[rid].set_result(msg.get("text", ""))
                         del pending[rid]
+                    elif rid in stream_queues:
+                        final_text = msg.get("text", "")
+                        if final_text:
+                            await stream_queues[rid].put({"type": "delta", "content": final_text})
+                        await stream_queues[rid].put({"type": "done"})
+                        del stream_queues[rid]
 
                 elif mtype == "error":
                     rid = msg.get("id")
@@ -408,6 +705,17 @@ async def main():
                     if rid in stream_queues:
                         await stream_queues[rid].put({"type": "delta", "content": msg.get("content", "")})
 
+                elif mtype == "poll":
+                    rid = msg.get("id")
+                    poll = msg.get("poll", {}) or {}
+                    log.info("poll_interval", extra={
+                        "rid": rid,
+                        "request_id": msg.get("request_id"),
+                        "count": poll.get("poll_index"),
+                        "elapsed_ms": poll.get("interval_ms"),
+                        "detail": f"text_changed={poll.get('text_changed')} generating={poll.get('generating')} assistant_count={poll.get('assistant_count')}",
+                    })
+
                 elif mtype == "done":
                     rid = msg.get("id")
                     if rid in stream_queues:
@@ -419,15 +727,44 @@ async def main():
 
                 elif mtype == "watchdog_events":
                     events = msg.get("events", [])
-                    watchdog_events.extend(events)
-                    if len(watchdog_events) > 20:
-                        watchdog_events[:] = watchdog_events[-20:]
+                    if isinstance(events, list) and events:
+                        watchdog_events[:] = events[-20:]
                     log.info("watchdog_sync", extra={"count": len(events)})
+
+                elif mtype == "model_catalog":
+                    rid = msg.get("id")
+                    models = msg.get("models", [])
+                    if isinstance(models, list):
+                        state.available_models = _unique_model_labels(models)
+                        state.available_models_fetched_at = int(msg.get("fetched_at") or time.time())
+                    if rid in model_catalog_pending:
+                        model_catalog_pending[rid].set_result(list(state.available_models))
+                        del model_catalog_pending[rid]
+
+                elif mtype == "model_catalog_error":
+                    rid = msg.get("id")
+                    err_msg = msg.get("error", "unknown")
+                    if rid in model_catalog_pending:
+                        model_catalog_pending[rid].set_exception(RuntimeError(err_msg))
+                        del model_catalog_pending[rid]
+
+                elif mtype == "watchdog_status":
+                    watchdog_status = {
+                        "recovery_events": msg.get("recovery_events", 0),
+                        "last_recovery": msg.get("last_recovery"),
+                        "chrome_alive": bool(msg.get("chrome_alive", False)),
+                    }
+                    events = msg.get("events", [])
+                    if isinstance(events, list) and events:
+                        watchdog_events[:] = events[-20:]
+                    log.info("watchdog_status_sync", extra={"count": watchdog_status.get("recovery_events", 0)})
 
         except Exception as e:
             log.error("ws_handler_exception", extra={"error": str(e)}, exc_info=True)
         finally:
             connected_extensions.discard(ws)
+            if not connected_extensions:
+                extension_connected_since = None
             log.warning("extension_disconnected", extra={"queue_len": len(connected_extensions)})
             for rid in list(pending.keys()):
                 if not pending[rid].done():
@@ -441,6 +778,7 @@ async def main():
     async def _send_to_extension(msg_data):
         async with ws_lock:
             sent = False
+            send_started = time.time()
             for ext in list(connected_extensions):
                 try:
                     await ext.send(json.dumps(msg_data))
@@ -449,16 +787,62 @@ async def main():
                     log.warning("ws_send_failed", extra={"error": str(e)})
             if not sent:
                 raise RuntimeError("Failed to send to any extension")
+            return round((time.time() - send_started) * 1000)
 
-    async def _send_and_wait(msg_data, timeout_s, rid):
-        await _send_to_extension(msg_data)
+    async def _send_and_wait(msg_data, timeout_s, rid, *, prompt_chars=None, req_type=None):
+        ws_send_ms = await _send_to_extension(msg_data)
+        log.info("ws_send",
+                 extra={"rid": rid,
+                        "type": req_type,
+                        "elapsed_ms": ws_send_ms,
+                        "status": "ok"})
         ts = time.time()
         result = await asyncio.wait_for(pending[rid], timeout=timeout_s)
         elapsed = (time.time() - ts) * 1000
         log.info("response_received",
-                 extra={"rid": rid, "response_chars": len(result),
-                        "elapsed_ms": round(elapsed)})
-        return result
+                 extra={"rid": rid,
+                        "type": req_type,
+                        "prompt_chars": prompt_chars,
+                        "response_chars": len(result),
+                        "elapsed_ms": round(elapsed),
+                        "status": "ok"})
+        return result, ws_send_ms
+
+    def _build_debug(result, ws_send_ms, request_started_at):
+        meta = result.get("_debug") if isinstance(result, dict) else None
+        meta = meta or {}
+        return {
+            "elapsed_ms": meta.get("elapsed_ms", round((time.time() - request_started_at) * 1000)),
+            "ws_send_ms": ws_send_ms,
+            "poll_count": meta.get("poll_count"),
+            "poll_intervals_ms": meta.get("poll_intervals_ms"),
+        }
+
+    async def _ensure_model_catalog(timeout_s=15, force_refresh=False):
+        if state.available_models and not force_refresh and not _catalog_is_stale(state):
+            return list(state.available_models)
+        if state.available_models and not force_refresh and not connected_extensions:
+            return list(state.available_models)
+        if not connected_extensions:
+            raise RuntimeError("No ChatGPT tab connected")
+        async with model_catalog_refresh_lock:
+            if state.available_models and not force_refresh and not _catalog_is_stale(state):
+                return list(state.available_models)
+            rid = f"models-{int(time.time() * 1000)}-{len(model_catalog_pending) + 1}"
+            fut = asyncio.get_event_loop().create_future()
+            model_catalog_pending[rid] = fut
+            try:
+                await _send_to_extension({"type": "list_models", "id": rid, "timeout": timeout_s})
+                models = await asyncio.wait_for(fut, timeout=timeout_s)
+                return list(models)
+            finally:
+                model_catalog_pending.pop(rid, None)
+
+    def _resolve_model_search_or_404(model_search):
+        models = list(state.available_models or [])
+        if not model_search:
+            return None, models
+        return _best_model_match(model_search, models), models
 
     # ─── Per-assignee bookkeeping ───────────────────────────────────────────
 
@@ -483,6 +867,7 @@ async def main():
 
     async def chat_completions(request):
         global total_requests, successful_requests, timed_out_requests, failed_requests, last_response_time
+        nonlocal counter
 
         try:
             body = await request.json()
@@ -497,7 +882,26 @@ async def main():
         model_search = body.get("model_search") or None
         if not model_search and model.startswith("chatgpt-"):
             model_search = model[len("chatgpt-"):]
+        if model_search:
+            try:
+                await _ensure_model_catalog(timeout_s=15)
+            except Exception as e:
+                failed_requests += 1; _incr_assignee(assignee, "error")
+                return web.json_response({"error": {"message": str(e), "type": "server_error"}}, status=503)
+            resolved_model, available_models = _resolve_model_search_or_404(model_search)
+            if resolved_model is None:
+                return web.json_response({
+                    "error": {
+                        "message": f"Model not found: {model_search}",
+                        "type": "model_not_found",
+                        "available_models": _format_model_catalog(available_models, state.available_models_fetched_at),
+                    }
+                }, status=404)
+            model_search = resolved_model
         stream = body.get("stream", False)
+        debug = _is_truthy(request.rel_url.query.get("debug") or body.get("debug", False))
+        request_id = request.get("request_id")
+        request_started_at = time.time()
         conversation_id = body.get("conversation_id") or None
         timeout_s = body.get("timeout", 10)
         if timeout_s > 600:
@@ -568,8 +972,12 @@ async def main():
 
         total_requests += 1; counter += 1; rid = str(counter)
         log.info("request_received",
-                 extra={"rid": rid, "assignee": assignee,
+                 extra={"rid": rid, "request_id": request_id, "assignee": assignee,
+                        "type": "/v1/chat/completions",
                         "prompt_chars": prompt_chars,
+                        "response_chars": None,
+                        "elapsed_ms": None,
+                        "status": "started",
                         "code": "v1/chat/completions"})
 
         msg_data = {
@@ -577,6 +985,7 @@ async def main():
             "id": rid, "prompt": full_prompt, "options": {},
             "files": [], "timeout": timeout_s,
             "conversation_id": conversation_id, "model_search": model_search,
+            "debug": debug,
         }
 
         if stream:
@@ -611,19 +1020,29 @@ async def main():
                 failed_requests += 1; _incr_assignee(assignee, "error")
                 return web.json_response({"error": {"message": str(e), "type": "server_error"}}, status=500)
             response = web.StreamResponse(
-                status=200, content_type="text/event-stream",
+                status=200,
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
-                         "X-Accel-Buffering": "no", "Access-Control-Allow-Origin": "*"})
+                         "Content-Type": "text/event-stream", "X-Accel-Buffering": "no",
+                         "Access-Control-Allow-Origin": "*"})
+            response.headers["X-Request-Id"] = request_id
             await response.prepare(request)
             async for chunk in sse_generator():
                 await response.write(chunk.encode())
             await response.write_eof()
+            _stream_elapsed = round((time.time() - created_at) * 1000)
+            log.info("response_received",
+                     extra={"rid": rid,
+                            "type": "/v1/chat/completions",
+                            "prompt_chars": prompt_chars,
+                            "response_chars": 0,
+                            "elapsed_ms": _stream_elapsed,
+                            "status": "ok"})
             return response
 
         # non-streaming path
         pending[rid] = future = asyncio.get_event_loop().create_future()
         try:
-            result = await _send_and_wait(msg_data, timeout_s, rid)
+            result, ws_send_ms = await _send_and_wait(msg_data, timeout_s, rid, prompt_chars=prompt_chars, req_type="/v1/chat/completions")
             pending.pop(rid, None)
             meta = pending_meta.pop(rid, {})
             conv_id = meta.get("conversation_id"); conv_title = meta.get("conversation_title")
@@ -631,32 +1050,40 @@ async def main():
             _incr_assignee(assignee, "success")
             response_chars = len(result)
             completion_id = f"chatcmpl-{int(time.time())}"
+            assistant_text = result
             resp = {"id": completion_id, "object": "chat.completion",
                     "created": int(time.time()), "model": model,
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": result},
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": assistant_text},
                                  "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": prompt_chars // 4,
                               "completion_tokens": response_chars // 4,
                               "total_tokens": (prompt_chars + response_chars) // 4}}
             if conv_id: resp["conversation_id"] = conv_id
             if conv_title: resp["conversation_title"] = conv_title
+            if debug:
+                resp["_debug"] = _build_debug({"_debug": meta.get("_debug")}, ws_send_ms, request_started_at)
+                log.info("poll_summary", extra={"rid": rid, "request_id": request_id, "count": resp["_debug"].get("poll_count"), "detail": f"intervals={resp['_debug'].get('poll_intervals_ms')}"})
+            log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/v1/chat/completions", "status": "ok"})
             return web.json_response(resp)
         except asyncio.TimeoutError:
             pending.pop(rid, None); pending_meta.pop(rid, None)
             timed_out_requests += 1; _incr_assignee(assignee, "timeout")
-            log.warning("request_timeout", extra={"rid": rid, "status": "timeout",
+            log.warning("request_timeout", extra={"rid": rid, "request_id": request_id, "status": "timeout",
                                                   "elapsed_ms": timeout_s * 1000})
+            log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/v1/chat/completions", "status": "timeout"})
             return web.json_response({"error": {"message": f"Timed out ({timeout_s}s)", "type": "timeout"}}, status=504)
         except Exception as e:
             pending.pop(rid, None); pending_meta.pop(rid, None)
             failed_requests += 1; _incr_assignee(assignee, "error")
-            log.error("request_error", extra={"rid": rid, "status": "error", "error": str(e)})
+            log.error("request_error", extra={"rid": rid, "request_id": request_id, "status": "error", "error": str(e)})
+            log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/v1/chat/completions", "status": "error"})
             return web.json_response({"error": {"message": str(e), "type": "server_error"}}, status=500)
 
     # ─── /chat handler ──────────────────────────────────────────────────────
 
     async def chat(request):
         global total_requests, successful_requests, timed_out_requests, failed_requests, last_response_time
+        nonlocal counter
         log.debug("http_request", extra={"method": "POST", "path": "/chat"})
         try:
             raw_body = await request.read()
@@ -668,6 +1095,25 @@ async def main():
         assignee = body.get("assignee") or ""
         conversation_id = body.get("conversation_id") or state.last_conversation_id or None
         model_search = body.get("model_search") or None
+        if model_search:
+            try:
+                await _ensure_model_catalog(timeout_s=15)
+            except Exception as e:
+                failed_requests += 1; _incr_assignee(assignee, "error")
+                return web.json_response({"error": f"{e}"}, status=503)
+            resolved_model, available_models = _resolve_model_search_or_404(model_search)
+            if resolved_model is None:
+                return web.json_response({
+                    "error": {
+                        "message": f"Model not found: {model_search}",
+                        "type": "model_not_found",
+                        "available_models": _format_model_catalog(available_models, state.available_models_fetched_at),
+                    }
+                }, status=404)
+            model_search = resolved_model
+        debug = _is_truthy(request.rel_url.query.get("debug") or body.get("debug", False))
+        request_id = request.get("request_id")
+        request_started_at = time.time()
         timeout_s = body.get("timeout", 10)
         if timeout_s > 600: timeout_s = 600
         if not prompt and not files:
@@ -706,56 +1152,87 @@ async def main():
 
         total_requests += 1; counter += 1; rid = str(counter)
         log.info("request_received",
-                 extra={"rid": rid, "assignee": assignee,
+                 extra={"rid": rid, "request_id": request_id, "assignee": assignee,
+                        "type": "/chat",
                         "prompt_chars": len(prompt),
+                        "response_chars": None,
+                        "elapsed_ms": None,
+                        "status": "started",
                         "code": "/chat"})
         pending[rid] = future = asyncio.get_event_loop().create_future()
         msg_data = {"type": "prompt", "id": rid, "prompt": prompt,
                     "options": options, "files": [], "timeout": timeout_s,
-                    "conversation_id": conversation_id, "model_search": model_search}
+                    "conversation_id": conversation_id, "model_search": model_search,
+                    "debug": debug}
         try:
-            result = await _send_and_wait(msg_data, timeout_s, rid)
+            result, ws_send_ms = await _send_and_wait(msg_data, timeout_s, rid, prompt_chars=len(prompt), req_type="/chat")
             pending.pop(rid, None)
             meta = pending_meta.pop(rid, {})
             conv_id = meta.get("conversation_id"); conv_title = meta.get("conversation_title")
             successful_requests += 1; last_response_time = time.strftime("%H:%M:%S")
             _incr_assignee(assignee, "success")
             response_chars = len(result)
+            assistant_text = result
             try:
-                parsed = json.loads(result)
+                parsed = json.loads(assistant_text)
                 if isinstance(parsed, dict) and "type" in parsed:
                     resp = {"success": True, **parsed}
                     if conv_id: resp["conversation_id"] = conv_id
                     if conv_title: resp["conversation_title"] = conv_title
+                    if debug:
+                        resp["_debug"] = _build_debug({"_debug": meta.get("_debug")}, ws_send_ms, request_started_at)
+                    log.info("poll_summary", extra={"rid": rid, "request_id": request_id, "count": resp.get("_debug", {}).get("poll_count") if debug else None, "detail": f"intervals={(resp.get('_debug', {}) or {}).get('poll_intervals_ms')}"})
+                    log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/chat", "status": "ok"})
                     return web.json_response(resp)
             except (json.JSONDecodeError, TypeError):
                 pass
-            return web.json_response({"success": True, "type": "text", "text": result,
-                                      **({"conversation_id": conv_id} if conv_id else {}),
-                                      **({"conversation_title": conv_title} if conv_title else {})})
+            resp = {"success": True, "type": "text", "text": assistant_text,
+                     **({"conversation_id": conv_id} if conv_id else {}),
+                     **({"conversation_title": conv_title} if conv_title else {})}
+            if debug:
+                resp["_debug"] = _build_debug({"_debug": meta.get("_debug")}, ws_send_ms, request_started_at)
+                log.info("poll_summary", extra={"rid": rid, "request_id": request_id, "count": resp["_debug"].get("poll_count"), "detail": f"intervals={resp['_debug'].get('poll_intervals_ms')}"})
+            log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/chat", "status": "ok"})
+            return web.json_response(resp)
         except asyncio.TimeoutError:
             pending.pop(rid, None); pending_meta.pop(rid, None)
             timed_out_requests += 1; _incr_assignee(assignee, "timeout")
-            log.warning("request_timeout", extra={"rid": rid, "status": "timeout",
+            log.warning("request_timeout", extra={"rid": rid, "request_id": request_id, "status": "timeout",
                                                   "elapsed_ms": timeout_s * 1000})
+            log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/chat", "status": "timeout"})
             return web.json_response({"success": False, "error": f"Timed out ({timeout_s}s)"})
         except Exception as e:
             pending.pop(rid, None); pending_meta.pop(rid, None)
             failed_requests += 1; _incr_assignee(assignee, "error")
-            log.error("request_error", extra={"rid": rid, "status": "error", "error": str(e)})
+            log.error("request_error", extra={"rid": rid, "request_id": request_id, "status": "error", "error": str(e)})
+            log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/chat", "status": "error"})
             return web.json_response({"success": False, "error": str(e)})
+
+    async def models(request):
+        try:
+            await _ensure_model_catalog(timeout_s=15)
+        except Exception:
+            if not state.available_models:
+                return web.json_response({"error": {"message": "No model catalog available", "type": "server_error"}}, status=503)
+        return web.json_response(_catalog_payload(state))
 
     # ─── /health handler ────────────────────────────────────────────────────
 
     async def health(request):
         uptime_s = int(time.time() - start_time)
+        extension_uptime_s = int(time.time() - extension_connected_since) if extension_connected_since else 0
         cdp_page_id, cdp_url = _find_chatgpt_tab_cdp()
         cdp_status = {"available": cdp_page_id is not None, "page_id": cdp_page_id, "url": cdp_url}
+        watchdog_summary = watchdog_status or summarize_watchdog_events(watchdog_events)
         payload = {
             "status": "ok" if cdp_page_id else "degraded",
             "extensions": len(connected_extensions),
             "cdp": cdp_status,
             "uptime": f"{uptime_s // 3600}h{(uptime_s % 3600) // 60}m{uptime_s % 60}s",
+            "uptime_breakdown": {
+                "bridge": format_uptime(uptime_s),
+                "extension_connected": format_uptime(extension_uptime_s),
+            },
             "uptime_seconds": uptime_s,
             "requests": {"total": total_requests, "success": successful_requests,
                          "timeout": timed_out_requests, "failed": failed_requests},
@@ -764,7 +1241,22 @@ async def main():
             "last_response": last_response_time,
             "last_conversation_id": state.last_conversation_id,
             "last_conversation_title": state.last_conversation_title,
-            "watchdog_recovery": watchdog_events[-5:],
+            "watchdog": {
+                "recovery_events": watchdog_summary.get("recovery_events", 0),
+                "last_recovery": watchdog_summary.get("last_recovery"),
+                "chrome_alive": bool(cdp_page_id is not None),
+            },
+            "watchdog_events": watchdog_summary.get("events", watchdog_events[-5:]),
+            "watchdog_recovery": watchdog_summary.get("events", watchdog_events[-5:]),
+            "models": {
+                "available": _format_model_catalog(state.available_models, state.available_models_fetched_at),
+                "fetched_at": int(state.available_models_fetched_at or 0),
+                "stale": _catalog_is_stale(state),
+            },
+            "bridge_limits": {
+                "max_concurrent": max_concurrent,
+                "rate_limit_per_minute": rate_limit,
+            },
             "per_assignee_requests": per_assignee_requests,
         }
         log.debug("health_requested", extra={"queues": len(stream_queues), "pending": len(pending)})
@@ -802,36 +1294,52 @@ async def main():
 
     @web.middleware
     async def error_mw(request, handler):
+        request_id = uuid.uuid4().hex
+        request["request_id"] = request_id
         try:
-            return await handler(request)
+            response = await handler(request)
+            try:
+                response.headers["X-Request-Id"] = request_id
+            except Exception:
+                pass
+            return response
         except Exception as e:
-            log.error("unhandled_error", extra={"error": str(e)}, exc_info=True)
+            log.error("unhandled_error", extra={"request_id": request_id, "error": str(e)}, exc_info=True)
             traceback.print_exc()
-            return web.json_response({"error": str(e)}, status=500)
+            return web.json_response({"error": str(e)}, status=500, headers={"X-Request-Id": request_id})
 
-    app = web.Application(middlewares=[error_mw])
+    app = web.Application(middlewares=[error_mw, request_gate])
     app.router.add_get("/health", health)
+    app.router.add_get("/v1/models", models)
     app.router.add_get("/v1/cdp/status", cdp_status)
     app.router.add_post("/reload", reload_ext)
     app.router.add_post("/chat", chat)
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_options("/v1/chat/completions", cors)
     app.router.add_options("/chat", cors)
+    app.router.add_options("/v1/models", cors)
     app.router.add_options("/v1/cdp/status", cors)
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", HTTP_PORT)
     await site.start()
+
+    ws_server = await websockets.serve(ws_handler, "127.0.0.1", WS_PORT)
+
     log.info("http_listening", extra={"queue_len": HTTP_PORT})
     log.info("ws_listening", extra={"qc": WS_PORT})
     log.info("bridge_ready")
 
+    stop = asyncio.Event()
     try:
-        await asyncio.Event().wait()
+        await stop.wait()
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
-    await runner.cleanup()
+    finally:
+        ws_server.close()
+        await ws_server.wait_closed()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":

@@ -62,6 +62,7 @@ async function injectContentScript(tabId, reason = "unknown") {
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ["content.js"],
+      world: "ISOLATED",
     });
     logInjection(tabId, null, "OK", reason, "script injected");
     return true;
@@ -151,8 +152,31 @@ function logWatchdog(event, tabId, detail = "") {
         type: "watchdog_events",
         events: watchdogLog.slice(-5),
       }));
+      ws.send(JSON.stringify(buildWatchdogStatusPayload()));
     } catch (_) { /* bridge may be down during rel; onreconnect will sync */ }
   }
+}
+
+function buildWatchdogStatusPayload(chromeAlive = connectedTabs.size > 0) {
+  const last = watchdogLog[watchdogLog.length - 1] || null;
+  return {
+    type: "watchdog_status",
+    recovery_events: watchdogLog.length,
+    last_recovery: last?.ts || null,
+    chrome_alive: chromeAlive,
+    events: watchdogLog.slice(-5),
+  };
+}
+
+async function publishWatchdogStatus() {
+  let chromeAlive = connectedTabs.size > 0;
+  try {
+    const tabs = await chrome.tabs.query({ url: CHATGPT_URL_PATTERN });
+    chromeAlive = tabs.some((tab) => tab.id && isChatGptUrl(tab.url));
+  } catch (_) {
+    // Best-effort only — fall back to the live port map.
+  }
+  sendWs(buildWatchdogStatusPayload(chromeAlive));
 }
 
 /**
@@ -271,12 +295,18 @@ chrome.runtime.onConnect.addListener((port) => {
       );
       // Port (re)connected — cancel any watchdog for this tab
       cancelWatchdog(tabId);
+      requestModelCatalog("content-connect").catch((err) => {
+        console.warn("[ChatGPT Bridge] model catalog refresh failed", err?.message || err);
+      });
     }
 
     // Forward any messages the content script sends through the port.
     port.onMessage.addListener((msg, _sender) => {
       if (msg.action === "ping") {
         port.postMessage({ action: "pong" });
+      }
+      if (msg.action === "poll") {
+        sendWs({ type: "poll", id: msg.id, request_id: msg.id, poll: msg.poll || {} });
       }
     });
 
@@ -350,6 +380,31 @@ async function sendToContentScript(tabId, message) {
   }
 }
 
+async function requestModelCatalog(reason = "manual", requestId = null) {
+  const tab = await findChatGptTab();
+  if (!tab || !tab.id) {
+    throw new Error("No ChatGPT tab found. Open https://chatgpt.com/ first.");
+  }
+  await injectIfMissing(tab, reason);
+  const rid = requestId || `models-${Date.now()}`;
+  const result = await sendToContentScript(tab.id, {
+    action: "enumerate_models",
+    request_id: rid,
+  });
+  if (!result || result.success === false) {
+    throw new Error(result?.error || "Could not enumerate models");
+  }
+  const models = Array.isArray(result.models) ? result.models : [];
+  sendWs({
+    type: "model_catalog",
+    id: rid,
+    models,
+    fetched_at: Date.now(),
+    source: reason,
+  });
+  return models;
+}
+
 // ── Bridge WebSocket ─────────────────────────────────────────────────────
 
 async function handleBridgePrompt(data) {
@@ -376,6 +431,7 @@ async function handleBridgePrompt(data) {
           conversation_id: data.conversation_id || null,
           model_search: data.model_search || null,
           stream: data.stream || false,
+          debug: !!data.debug,
           id: data.id || "",
         });
 
@@ -390,6 +446,7 @@ async function handleBridgePrompt(data) {
           text: result.text || "",
           conversation_id: result.conversation_id || null,
           conversation_title: result.conversation_title || null,
+          _debug: result._debug || null,
         });
         return;
       } catch (err) {
@@ -482,6 +539,10 @@ async function connectWs() {
     connecting = false;
     reconnectDelay = 2000;
     injectOpenChatGptTabs("ws-open");
+    publishWatchdogStatus();
+    requestModelCatalog("ws-open").catch((err) => {
+      console.warn("[ChatGPT Bridge] model catalog refresh failed", err?.message || err);
+    });
   };
 
   ws.onmessage = (event) => {
@@ -494,6 +555,10 @@ async function connectWs() {
 
     if (data.type === "prompt" && data.id) {
       handleBridgePrompt(data);
+    } else if (data.type === "list_models") {
+      requestModelCatalog(data.reason || "manual", data.id || null).catch((err) => {
+        sendWs({ type: "model_catalog_error", id: data.id || null, error: err?.message || String(err) });
+      });
     } else if (data.type === "reload") {
       handleBridgeReload();
     }
@@ -581,6 +646,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === "done") {
     sendWs({ type: "done", id: message.id });
+    sendResponse({ received: true });
+    return false;
+  }
+
+  if (message.action === "poll") {
+    sendWs({ type: "poll", id: message.id, poll: message.poll || {} });
     sendResponse({ received: true });
     return false;
   }

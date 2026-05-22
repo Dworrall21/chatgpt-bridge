@@ -1,456 +1,482 @@
 #!/usr/bin/env python3
-"""
-chatgpt-extension integration test suite (T23)
-Exercises the full pipeline against the running bridge-server.
+"""Integration test suite for the ChatGPT Bridge extension.
 
-Bridge under test: bridge-host.py
-  HTTP  http://127.0.0.1:11557
-  WS    ws://127.0.0.1:11558
-  CDP   http://127.0.0.1:9222  (Chrome)
+This script exercises the live bridge + Chrome + extension pipeline. It exits
+with code 0 only when every check passes.
 
-Run: python3 tests/test_integration.py
-Exit code: 0 = all pass, 1 = any fail
+Run:
+  python3 tests/test_integration.py
 """
 
-# ─── stdlib only – no extra installs ─────────────────────────────────────
+from __future__ import annotations
+
+import http.client
 import json
-import os
+import socket
 import sys
 import time
-import struct
-import traceback
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from io import BytesIO
-from threading import Thread
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Any, Iterable
 
-try:
-    import websockets               # needed by bridge; not used directly here
-except ImportError:
-    pass
-
-# ─── Configuration ───────────────────────────────────────────────────────
-BRIDGE_BASE  = "http://127.0.0.1:11557"
-TIMEOUT      = 90          # seconds per request (bridge default = 180)
-TURNAROUND   = 90          # max seconds for the bridge to return a response
-SHORT_TURN   = 15          # task spec bound – used as assertion when possible
-
-REQUIRED_PORTS = {
-    "HTTP (bridge)": 11557,
-    "WS   (bridge)": 11558,
-    "CDP  (Chrome)": 9222,
-}
-
-PASS = "\033[32mPASS\033[0m"
-FAIL = "\033[31mFAIL\033[0m"
-SKIP = "\033[33mSKIP\033[0m"
+BRIDGE_URL = "http://127.0.0.1:11557"
+CDP_URL = "http://127.0.0.1:9222"
+HTTP_TIMEOUT = 60
+LONG_TIMEOUT = 300
+STREAM_OVERALL_TIMEOUT = 180
+STREAM_READ_TIMEOUT = 5
+SHORT_PROMPT = "Say hello"
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────
-
-def check_ports() -> bool:
-    """Return True if all required ports are listening."""
-    import socket
-    all_ok = True
-    for label, port in REQUIRED_PORTS.items():
-        try:
-            s = socket.create_connection(("127.0.0.1", port), timeout=2)
-            s.close()
-            print(f"  {label}:{port}  \u2714 open")
-        except Exception:
-            print(f"  {label}:{port}  \u2717 NOT reachable")
-            all_ok = False
-    return all_ok
+@dataclass
+class HttpResult:
+    status: int
+    body: Any
+    raw: bytes
+    content_type: str
+    headers: dict[str, str]
+    elapsed: float
 
 
-def req(method: str, path: str, body: dict | None = None, timeout: int = TIMEOUT) -> tuple[int, dict]:
-    """Send a JSON HTTP request.  Returns (status, parsed_body)."""
-    url = urljoin(BRIDGE_BASE + "/", path.lstrip("/"))
-    data = (json.dumps(body) if body else None)
-    r = Request(url, data=json.dumps(body).encode() if body else b"",
-                headers={"Content-Type": "application/json"},
-                method=method)
-    try:
-        with urlopen(r, timeout=timeout) as resp:
-            raw = resp.read().decode()
-            try:
-                body = json.loads(raw)
-            except json.JSONDecodeError:
-                body = {"_raw": raw[:500]}
-            return resp.status, body
-    except HTTPError as e:
-        raw = ""
-        try:
-            raw = e.read().decode()[:500]
-        except Exception:
-            pass
-        try:
-            j = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            j = {"_raw": raw[:200]}
-        return e.code, j
-    except URLError as e:
-        return 0, {"error": str(e)}
+results: list[tuple[str, bool, str]] = []
+passed = 0
+failed = 0
 
 
-def strip_spi(text: str, n: int = 120) -> str:
-    """Truncate a response string for logging, preserving readable short text."""
-    cleaned = " ".join(text.split())
-    return cleaned[:n] + ("…" if len(cleaned) > n else "")
-
-
-def print_result(test_name: str, passed: bool, detail: str = ""):
-    symbol, marker = (PASS, "") if passed else (FAIL, "  ←")
-    print(f"  [{test_name}]", symbol, detail + marker)
-    return passed
-
-
-# ─── Test suite ──────────────────────────────────────────────────────────
-
-def test_health() -> bool:
-    """T1  GET /health → status ok, extensions ≥ 1."""
-    _t0 = time.monotonic()
-    status, body = req("GET", "/health", timeout=10)
-    elapsed = time.monotonic() - _t0
-
-    ok = True
-    if status != 200:
-        detail = f"HTTP {status}, body={body}"
-        ok = False
-    elif body.get("status") != "ok":
-        detail = f"status={body.get('status')!r}; body={body}"
-        ok = False
-    elif body.get("extensions", 0) < 1:
-        detail = f"extensions={body.get('extensions')!r}; body={body}"
-        ok = False
-    else:
-        detail = (f"status=ok, extensions={body['extensions']}, "
-                  f"uptime={body.get('uptime','?')}, RT≈{elapsed:.1f}s")
-    return print_result("T1-health", ok, detail)
-
-
-def test_chat_simple() -> bool:
-    """T2  POST /chat simple prompt → success in <TURNAROUND seconds."""
-    body = {"prompt": "Hi. Reply with exactly two words: OK DONE"}
-    _t0 = time.monotonic()
-    status, resp = req("POST", "/chat", body=body, timeout=TURNAROUND)
-    elapsed = time.monotonic() - _t0
-
-    ok = resp.get("success") is True and isinstance(resp.get("text"), str) and elapsed < TURNAROUND
-    text_snippet = strip_spi(resp.get("text", ""), 80) if ok else ""
-    detail = (f"HTTP {status}, success={resp.get('success')}, "
-              f"RT≈{elapsed:.1f}s, resp={text_snippet!r}")
-    if not ok:
-        detail += f"  full={resp}"
-    return print_result("T2-chat-simple", ok, detail)
-
-
-def test_v1_chat_completions() -> bool:
-    """T3  POST /v1/chat/completions → OpenAI-format response."""
-    body = {
-        "model": "chatgpt",
-        "messages": [
-            {"role": "user", "content": "Reply with exactly one word: PONG"}
-        ],
-        "timeout": TURNAROUND,
-    }
-    _t0 = time.monotonic()
-    status, resp = req("POST", "/v1/chat/completions", body=body, timeout=TURNAROUND)
-    elapsed = time.monotonic() - _t0
-
-    has_choices = resp.get("object") == "chat.completion" and "choices" in resp
-    has_content = (has_choices
-                   and len(resp.get("choices", [])) > 0
-                   and resp["choices"][0].get("message", {}).get("role") == "assistant"
-                   and len(resp["choices"][0]["message"].get("content", "")) > 0)
-    ok = status == 200 and has_content and elapsed < TURNAROUND
-
+def record(name: str, ok: bool, detail: str = "") -> None:
+    global passed, failed
+    results.append((name, ok, detail))
     if ok:
-        choice = resp["choices"][0]
-        detail = (f"HTTP {status}, object=chat.completion, "
-                  f"role={choice['message']['role']!r}, "
-                  f"content={strip_spi(choice['message']['content'], 60)!r}, "
-                  f"RT≈{elapsed:.1f}s")
+        passed += 1
+        print(f"  PASS  {name}")
     else:
-        detail = f"HTTP {status}, elapsed≈{elapsed:.1f}s, resp={resp}"
-    return print_result("T3-v1-format", ok, detail)
+        failed += 1
+        print(f"  FAIL  {name}: {detail}")
 
 
-def test_v1_conversation_continuation() -> bool:
-    """T4  Send conv_id → coherent 2nd response (different from 1st)."""
-    # First turn – grab conversation_id
-    body1 = {
-        "messages": [
-            {"role": "user", "content": "Say the word ALPHA followed by nothing else."}
-        ],
-        "timeout": TURNAROUND,
-    }
-    _, r1 = req("POST", "/v1/chat/completions", body=body1, timeout=TURNAROUND)
-    first_text = (r1.get("choices", [{}])[0].get("message", {}).get("content", "")) if r1 else ""
-    conv_id = r1.get("conversation_id", "") if r1 else ""
-
-    if not first_text or not conv_id:
-        detail = f"missing first turn data; r1={r1}"
-        return print_result("T4-conv-continuation", False, detail)
-
-    # Second turn with the same conversation_id
-    body2 = {
-        "messages": [
-            {"role": "user", "content": "Say the word BETA followed by nothing else."}
-        ],
-        "conversation_id": conv_id,
-        "timeout": TURNAROUND,
-    }
-    _, r2 = req("POST", "/v1/chat/completions", body=body2, timeout=TURNAROUND)
-    second_text = (r2.get("choices", [{}])[0].get("message", {}).get("content", "")) if r2 else ""
-
-    is_different = second_text.strip() and second_text.strip() != first_text.strip()
-    detail = (f"conv_id={conv_id[:12]}.., "
-              f"first={strip_spi(first_text)!r}, "
-              f"second={strip_spi(second_text)!r}, "
-              f"different={is_different}")
-    return print_result("T4-conv-continuation", bool(second_text) and is_different, detail)
+def fail(msg: str) -> None:
+    print(f"\nFATAL: {msg}", flush=True)
+    sys.exit(1)
 
 
-def test_model_selection() -> bool:
-    """T5  model_search param → different model behavior."""
-    prompts = [
-        {"model": "chatgpt",                          "messages": [{"role": "user", "content": "Reply with exactly ONE word: DEFAULT"}]},
-        {"model": "chatgpt", "model_search": "o3",   "messages": [{"role": "user", "content": "Reply with exactly ONE word: O3MODE"}]},
-    ]
-
-    responses = []
-    for pb in prompts:
-        _, resp = req("POST", "/v1/chat/completions",
-                      body={**pb, "timeout": TURNAROUND},
-                      timeout=TURNAROUND)
-        text = (resp.get("choices", [{}])[0].get("message", {}).get("content", "")) if resp else ""
-        responses.append(text)
-
-    ok = bool(responses[0]) and bool(responses[1])
-    detail = (f"default={strip_spi(responses[0], 35)!r}, "
-              f"o3-mode={strip_spi(responses[1], 35)!r}, "
-              f"different={responses[0].strip() != responses[1].strip()}")
-    return print_result("T5-model-selection", ok, detail)
-
-
-def parse_sse(raw: bytes) -> list[dict]:
-    """Parse an SSE stream … yield per-chunk dicts."""
-    s = raw.decode(errors="replace")
-    events = []
-    for line in s.splitlines():
-        line = line.strip()
-        if line.startswith("data: "):
-            data_str = line[6:]
-            if data_str.strip() == "[DONE]":
-                events.append({"type": "done", "raw": data_str})
-                continue
-            try:
-                events.append({"type": "chunk", "json": json.loads(data_str)})
-            except json.JSONDecodeError:
-                events.append({"type": "raw",  "raw": data_str})
-    return events
-
-
-def test_streaming() -> bool:
-    """T6  stream=true → SSE frames received, ends with [DONE]."""
-    body = {
-        "model": "chatgpt",
-        "messages": [
-            {"role": "user", "content": "Count from 1 to 5, one number per line."}
-        ],
-        "stream": True,
-        "timeout": TURNAROUND,
-    }
-    url = BRIDGE_BASE + "/v1/chat/completions"
-
-    req_obj = Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(req_obj, timeout=TURNAROUND) as resp:
-            raw = resp.read()             # binary – SSE body
-    except HTTPError as e:
-        raw = e.read() if hasattr(e, 'read') else b""
-
-    events = parse_sse(raw)
-    chunks  = [e for e in events if e["type"] == "chunk"]
-    dones   = [e for e in events if e["type"] == "done"]
-
-    has_content = any(
-        (e.get("json") or {}).get("choices", [{}])[0].get("delta", {}).get("content")
-        for e in chunks
-    )
-    ok = len(chunks) >= 1 and len(dones) >= 1 and has_content
-    detail = (f"chunks={len(chunks)}, done_signals={len(dones)}, "
-              f"has_content={has_content}, total_events={len(events)}")
-    if not ok and events:
-        detail += f"  first_event={events[0].get('json', events[0].get('raw','?'))!r}"
-    return print_result("T6-streaming", ok, detail)
-
-
-def test_error_handling() -> bool:
-    """T7  Error handling: no-extension → 503, no-Chrome → 504/error.
-
-    Note: Chrome is currently running (verified by test_ports / T1 health).
-    We cannot deliberately kill Chrome mid-test without disrupting all other
-    tests and the live bridge.  We therefore assert the bridge's known behaviour
-    for the no-extension case (503 body shape) and confirm Chrome is present for
-    the no-Chrome branch context.  Genuine negative tests for 503/504 require
-    a controlled teardown environment; those assertions are documented here as
-    expected when run in isolated infra.
-    """
-    # Check that the bridge returns 503 when we send a prompt with the
-    # expected error message when the extension is genuinely absent.
-    # Since the extension IS connected right now, we verify 200 → success SHAPE
-    # for the positive path, and then assert the error sub-tests are guarded
-    # by "extension NOT connected" state.
-
-    ok_ext_503 = False   # True if we can observe 503 from no-extension state
-    ok_chrome_504 = False
-
-    # Positive assertion: when everything is up, /chat returns success
-    status, resp = req("POST", "/chat",
-                       body={"prompt": "Hi. Reply: ECHO"},
-                       timeout=15)
-    ok = (status == 200 or status == 200 and resp.get("success") is True)
-
-    # We CANNOT test 503/504 here without stopping Chrome or killing the WS
-    # extension connection — those are infra-level assertions.
-    # Document expected shapes so the assertion is at least proven against
-    # the running server's actual error path (currently unavailable).
-    detail = (f"/chat returns HTTP {status} with extension connected; "
-              f"503/504 tests require infra-controlled teardown; "
-              f"spec expects {{error: 503}} / {{error: 504}} in that state")
-
-    # We still mark this as passing if the positive path works AND we document
-    # the negative expectations.  Full validation should be run in CI where
-    # Chrome/extension state can be toggled independently.
-    actually_passes = ok
-    return print_result("T7-error-handling", actually_passes, detail)
-
-
-def test_metrics_accumulate() -> bool:
-    """T8  Request counts increase across /chat calls."""
-    # Snapshot current metrics
-    _, health = req("GET", "/health", timeout=10)
-    total_before = health.get("requests", {}).get("total", None)
-    success_before = health.get("requests", {}).get("success", None)
-
-    if total_before is None:
-        # Try alternative metric key in bridge-host.py ("requests" → "total")
-        detail = (f"metric keys={list(health.get('requests', {}).keys()) if isinstance(health, dict) else 'N/A'}; "
-                  f"full health={health}")
-        # Accept either key name
-        if isinstance(health, dict):
-            total_before = (health.get("requests", {}).get("total")
-                            or health.get("total_requests"))
-        detail2 = f"total_before={total_before}"
-        if total_before is None:
-            return print_result("T8-metrics", False, detail + " ; " + detail2)
-
-    # Make two chat requests
-    for i in range(2):
-        _, resp = req("POST", "/chat",
-                      body={"prompt": f"Metrics test ping {i+1}. Reply: pong {i+1}"},
-                      timeout=TURNAROUND)
-        # resp may not contain success in some bridge versions, skip check here
-
-    # Snapshot again
-    _, health_after = req("GET", "/health", timeout=10)
-    total_after = (health_after.get("requests", {}).get("total")
-                   or health_after.get("total_requests"))
-
-    if total_after is None:
-        return print_result("T8-metrics", False,
-                            f"total_after is None; after-health={health_after}")
-
-    # The bridge counts total /chat subs (not /v1) in 'requests.total'
-    # Bridge may have background pings – assert delta >= the 2 we just sent.
-    if total_after <= total_before:
-        detail = (f"total did not increase: {total_before} → {total_after}; "
-                  f"after={health_after}")
-        return print_result("T8-metrics", False, detail)
-
-    delta = total_after - total_before
-    detail = (f"requests.total: {total_before} → {total_after} "
-              f"(Δ={delta} from our 2 chat requests)")
-    return print_result("T8-metrics", True, detail)
-
-
-TESTS = [
-    ("T1-health",                test_health),
-    ("T2-chat-simple",           test_chat_simple),
-    ("T3-v1-format",             test_v1_chat_completions),
-    ("T4-conv-continuation",     test_v1_conversation_continuation),
-    ("T5-model-selection",       test_model_selection),
-    ("T6-streaming",             test_streaming),
-    ("T7-error-handling",        test_error_handling),
-    ("T8-metrics",               test_metrics_accumulate),
-]
-
-
-def main():
-    print("=" * 62)
-    print("  ChatGPT Bridge — Integration Test Suite")
-    print(f"  Bridge : {BRIDGE_BASE}")
-    print(f"  Timeout: {TURNAROUND}s per request")
-    print("=" * 62)
-
-    # ── Prerequisites ──────────────────────────────────────────────────
-    print("\n[prereq] Checking required ports …")
-    if not check_ports():
-        print("\n[prereq] FAILED – one or more ports not reachable.")
-        print("  Start Chrome + bridge and retry.")
-        sys.exit(99)
-
-    # Verify HTTP is responding at all
-    status, _ = req("GET", "/health", timeout=5)
-    if status == 0:
-        print("\n[prereq] Bridge HTTP not reachable.  Aborting.")
-        sys.exit(99)
-    print(f"\n[prereq] Bridge ok, all ports open.  Running tests …\n")
-
-    # ── Run tests ──────────────────────────────────────────────────────
-    results: dict[str, bool] = {}
-    first_fail = None
-    for name, fn in TESTS:
+def _decode_body(raw: bytes, content_type: str) -> Any:
+    if not raw:
+        return ""
+    if content_type == "application/json" or content_type.endswith("+json"):
         try:
-            passed = fn()
-        except Exception as exc:
-            err = f"{type(exc).__name__}: {exc}"
-            tb = traceback.format_exc().strip().split("\n")[-1]
-            passed = print_result(name, False, f"{err} :: {tb}")
-        results[name] = passed
-        if not passed and first_fail is None:
-            first_fail = name
+            return json.loads(raw)
+        except Exception:
+            return raw.decode("utf-8", errors="replace")
+    return raw.decode("utf-8", errors="replace")
 
-    # ── Summary ────────────────────────────────────────────────────────
-    n_total   = len(results)
-    n_pass    = sum(1 for v in results.values() if v)
-    n_fail    = n_total - n_pass
-    sep = "=" * 62
 
-    print(f"\n{sep}")
-    print(f"  Results  {n_pass}/{n_total} passed")
-    print(f"{sep}")
-    for name, ok in results.items():
-        mark = PASS if ok else FAIL
-        print(f"  {mark}  {name}")
-    print(f"{sep}")
+def request_json(
+    method: str,
+    path: str,
+    body: Any | None = None,
+    *,
+    accept: str = "application/json",
+    timeout: int = HTTP_TIMEOUT,
+) -> HttpResult:
+    url = BRIDGE_URL + path
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", accept)
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+            ctype = resp.headers.get_content_type()
+            return HttpResult(
+                status=resp.status,
+                body=_decode_body(raw, ctype),
+                raw=raw,
+                content_type=ctype,
+                headers=headers,
+                elapsed=time.monotonic() - start,
+            )
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        headers = {k.lower(): v for k, v in (e.headers or {}).items()}
+        ctype = e.headers.get_content_type() if getattr(e, "headers", None) else "application/octet-stream"
+        return HttpResult(
+            status=e.code,
+            body=_decode_body(raw, ctype),
+            raw=raw,
+            content_type=ctype,
+            headers=headers,
+            elapsed=time.monotonic() - start,
+        )
+    except Exception as e:
+        return HttpResult(
+            status=-1,
+            body={"error": str(e)},
+            raw=b"",
+            content_type="error",
+            headers={},
+            elapsed=time.monotonic() - start,
+        )
 
-    if n_fail == 0:
-        print(f"\n  All {n_pass} tests passed ✓\n")
-        sys.exit(0)
-    else:
-        print(f"\n  {n_fail} test(s) failed (first: {first_fail})\n")
-        sys.exit(1)
+
+def request_json_retry(
+    method: str,
+    path: str,
+    body: Any | None = None,
+    *,
+    accept: str = "application/json",
+    timeout: int = HTTP_TIMEOUT,
+    attempts: int = 3,
+    retry_statuses: Iterable[int] = (-1, 429, 500, 502, 503, 504),
+) -> HttpResult:
+    retry_statuses = set(retry_statuses)
+    last: HttpResult | None = None
+    for attempt in range(1, attempts + 1):
+        last = request_json(method, path, body, accept=accept, timeout=timeout)
+        if last.status not in retry_statuses:
+            return last
+        if attempt < attempts:
+            time.sleep(min(4 * attempt, 10))
+    assert last is not None
+    return last
+
+
+def request_sse(
+    path: str,
+    body: Any,
+    *,
+    overall_timeout: int = STREAM_OVERALL_TIMEOUT,
+    read_timeout: int = STREAM_READ_TIMEOUT,
+) -> HttpResult:
+    payload = json.dumps(body).encode("utf-8")
+    conn = http.client.HTTPConnection("127.0.0.1", 11557, timeout=read_timeout)
+    start = time.monotonic()
+    conn.putrequest("POST", path)
+    conn.putheader("Content-Type", "application/json")
+    conn.putheader("Accept", "text/event-stream")
+    conn.putheader("Content-Length", str(len(payload)))
+    conn.endheaders()
+    conn.send(payload)
+    resp = conn.getresponse()
+    headers = {k.lower(): v for k, v in resp.getheaders()}
+    frames: list[str] = []
+    buffer = ""
+    deadline = start + overall_timeout
+    while True:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            chunk = resp.read(4096)
+        except (socket.timeout, TimeoutError):
+            continue
+        if not chunk:
+            break
+        buffer += chunk.decode("utf-8", errors="replace")
+        while "\n\n" in buffer:
+            frame, buffer = buffer.split("\n\n", 1)
+            frame = frame.strip()
+            if not frame:
+                continue
+            frames.append(frame)
+            if frame.strip() == "data: [DONE]":
+                elapsed = time.monotonic() - start
+                return HttpResult(
+                    status=resp.status,
+                    body={"frames": frames, "done": True},
+                    raw="\n\n".join(frames).encode("utf-8"),
+                    content_type=headers.get("content-type", "text/event-stream"),
+                    headers=headers,
+                    elapsed=elapsed,
+                )
+    elapsed = time.monotonic() - start
+    return HttpResult(
+        status=resp.status,
+        body={"frames": frames, "done": False, "error": "stream ended before [DONE]"},
+        raw="\n\n".join(frames).encode("utf-8"),
+        content_type=headers.get("content-type", "text/event-stream"),
+        headers=headers,
+        elapsed=elapsed,
+    )
+
+
+def parse_health() -> dict[str, Any]:
+    res = request_json("GET", "/health", timeout=10)
+    if res.status != 200 or not isinstance(res.body, dict):
+        fail(f"Bridge /health unavailable: status={res.status}, body={res.body!r}")
+    return res.body
+
+
+def assert_contains(haystack: str, needle: str) -> bool:
+    return needle.lower() in haystack.lower()
+
+
+def summarize_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return repr(obj)
+
+
+def main() -> int:
+    print("=== Prerequisites ===")
+
+    try:
+        cdp = urllib.request.urlopen(f"{CDP_URL}/json", timeout=5)
+        tabs = json.loads(cdp.read())
+        chatgpt_tabs = [t for t in tabs if "chatgpt.com" in t.get("url", "")]
+        if not chatgpt_tabs:
+            fail("Chrome CDP is reachable, but no chatgpt.com tab is open.")
+        print("  OK   Chrome CDP on 9222 + chatgpt.com tab open")
+    except Exception as exc:
+        fail(f"Chrome CDP not reachable on 9222: {exc}")
+
+    health = parse_health()
+    extensions = health.get("extensions", 0)
+    if extensions < 1:
+        fail(f"Bridge is healthy but extensions={extensions}; load the extension and reopen ChatGPT.")
+    print(f"  OK   Bridge on 11557, extensions={extensions}")
+
+    print("\n=== Test 1: GET /health → status ok, extensions=1 ===")
+    res1 = request_json("GET", "/health", timeout=10)
+    ok1 = (
+        res1.status == 200
+        and isinstance(res1.body, dict)
+        and res1.body.get("status") == "ok"
+        and res1.body.get("extensions") == 1
+        and isinstance(res1.body.get("requests"), dict)
+    )
+    record(
+        "health status+extensions",
+        ok1,
+        f"status={res1.body.get('status')!r}, extensions={res1.body.get('extensions')!r}, metrics={summarize_json(res1.body.get('requests'))}",
+    )
+    if not ok1:
+        return 1
+    baseline_requests = dict(res1.body["requests"])
+    baseline_total = int(baseline_requests.get("total", 0))
+    baseline_success = int(baseline_requests.get("success", 0))
+
+    print("\n=== Test 2: POST /chat simple prompt → success in <15 s ===")
+    res2 = request_json_retry(
+        "POST",
+        "/chat",
+        body={"prompt": SHORT_PROMPT, "timeout": LONG_TIMEOUT},
+        timeout=LONG_TIMEOUT + 30,
+    )
+    text2 = res2.body.get("response") if isinstance(res2.body, dict) else None
+    if text2 is None and isinstance(res2.body, dict):
+        text2 = res2.body.get("text")
+    ok2 = bool(res2.status == 200 and isinstance(res2.body, dict) and res2.body.get("success") is True and isinstance(text2, str) and text2.strip() and res2.elapsed < 15)
+    record(
+        "chat simple prompt",
+        ok2,
+        f"status={res2.status}, elapsed={res2.elapsed:.2f}s, text={text2!r}",
+    )
+    if not ok2:
+        return 1
+
+    print("\n=== Test 3: POST /v1/chat/completions → OpenAI-format response ===")
+    res3 = request_json_retry(
+        "POST",
+        "/v1/chat/completions",
+        body={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": SHORT_PROMPT}],
+            "timeout": LONG_TIMEOUT,
+        },
+        timeout=LONG_TIMEOUT + 30,
+    )
+    body3 = res3.body if isinstance(res3.body, dict) else {}
+    choices3 = body3.get("choices") if isinstance(body3, dict) else None
+    msg3 = choices3[0].get("message", {}) if isinstance(choices3, list) and choices3 else {}
+    text3 = msg3.get("content", "") if isinstance(msg3, dict) else ""
+    ok3 = bool(
+        res3.status == 200
+        and isinstance(body3, dict)
+        and body3.get("object") == "chat.completion"
+        and isinstance(choices3, list)
+        and len(choices3) == 1
+        and choices3[0].get("finish_reason") == "stop"
+        and isinstance(text3, str)
+        and text3.strip()
+        and isinstance(body3.get("conversation_id"), str)
+    )
+    record(
+        "openai format",
+        ok3,
+        f"status={res3.status}, object={body3.get('object')!r}, text={text3!r}, conv_id={body3.get('conversation_id')!r}",
+    )
+    if not ok3:
+        return 1
+    conv_id = body3["conversation_id"]
+
+    print("\n=== Test 4: Conversation continuation ===")
+    followup_prompt = (
+        "In your previous assistant reply, you answered exactly: "
+        f"{text3!r}. Reply with that exact text and nothing else."
+    )
+    res4 = request_json_retry(
+        "POST",
+        "/v1/chat/completions",
+        body={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": followup_prompt}],
+            "conversation_id": conv_id,
+            "timeout": LONG_TIMEOUT,
+        },
+        timeout=LONG_TIMEOUT + 30,
+    )
+    body4 = res4.body if isinstance(res4.body, dict) else {}
+    choices4 = body4.get("choices") if isinstance(body4, dict) else None
+    msg4 = choices4[0].get("message", {}) if isinstance(choices4, list) and choices4 else {}
+    text4 = msg4.get("content", "") if isinstance(msg4, dict) else ""
+    ok4 = bool(
+        res4.status == 200
+        and isinstance(body4, dict)
+        and body4.get("object") == "chat.completion"
+        and isinstance(choices4, list)
+        and len(choices4) == 1
+        and isinstance(text4, str)
+        and text4.strip()
+        and text3.strip() in text4
+        and body4.get("conversation_id") == conv_id
+    )
+    record(
+        "conversation continuation",
+        ok4,
+        f"status={res4.status}, conv_id={body4.get('conversation_id')!r}, expected_text={text3!r}, got={text4!r}",
+    )
+    if not ok4:
+        return 1
+
+    print("\n=== Test 5: Model selection (model_search parameter) ===")
+    model_prompt = "Write one short, vivid sentence about a bridge crossing a stormy river."
+    plain = request_json_retry(
+        "POST",
+        "/chat",
+        body={"prompt": model_prompt, "timeout": LONG_TIMEOUT},
+        timeout=LONG_TIMEOUT + 30,
+    )
+    search = request_json_retry(
+        "POST",
+        "/chat",
+        body={"prompt": model_prompt, "model_search": "thinking", "timeout": LONG_TIMEOUT},
+        timeout=LONG_TIMEOUT + 30,
+    )
+    plain_text = plain.body.get("text") if isinstance(plain.body, dict) else ""
+    search_text = search.body.get("text") if isinstance(search.body, dict) else ""
+    ok5 = bool(
+        plain.status == 200
+        and search.status == 200
+        and isinstance(plain_text, str)
+        and isinstance(search_text, str)
+        and plain_text.strip()
+        and search_text.strip()
+        and search.body.get("success") is True
+        and plain.body.get("success") is True
+        and (plain_text != search_text or plain.body.get("conversation_id") != search.body.get("conversation_id"))
+    )
+    record(
+        "model_search accepted",
+        ok5,
+        f"plain={plain_text!r}, model_search={search_text!r}, plain_conv={plain.body.get('conversation_id')!r}, search_conv={search.body.get('conversation_id')!r}",
+    )
+    if not ok5:
+        return 1
+
+    v1_model_search = request_json_retry(
+        "POST",
+        "/v1/chat/completions",
+        body={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": model_prompt}],
+            "model_search": "thinking",
+            "timeout": LONG_TIMEOUT,
+        },
+        timeout=LONG_TIMEOUT + 30,
+    )
+    body5b = v1_model_search.body if isinstance(v1_model_search.body, dict) else {}
+    ok5b = bool(v1_model_search.status == 200 and body5b.get("object") == "chat.completion")
+    record(
+        "model_search accepted (v1)",
+        ok5b,
+        f"status={v1_model_search.status}, object={body5b.get('object')!r}, model={body5b.get('model')!r}",
+    )
+    if not ok5b:
+        return 1
+
+    print("\n=== Test 6: Streaming (SSE) ===")
+    stream_body = {
+        "model": "chatgpt",
+        "messages": [{"role": "user", "content": "Say hello"}],
+        "stream": True,
+        "timeout": LONG_TIMEOUT,
+    }
+    res6 = request_sse("/v1/chat/completions", stream_body)
+    frames = res6.body.get("frames", []) if isinstance(res6.body, dict) else []
+    done = bool(res6.body.get("done")) if isinstance(res6.body, dict) else False
+    saw_done = any(frame.strip() == "data: [DONE]" for frame in frames)
+    saw_chunk = any("chat.completion.chunk" in frame for frame in frames)
+    ok6 = bool(res6.status == 200 and saw_chunk and (done or saw_done))
+    record(
+        "streaming SSE",
+        ok6,
+        f"status={res6.status}, frames={len(frames)}, saw_chunk={saw_chunk}, done={done}, elapsed={res6.elapsed:.2f}s, error={res6.body.get('error') if isinstance(res6.body, dict) else None!r}",
+    )
+    if not ok6:
+        return 1
+
+    print("\n=== Test 7: Error handling ===")
+    bad_method = request_json("GET", "/chat", timeout=10)
+    bad_json = request_json(
+        "POST",
+        "/chat",
+        body={"timeout": 10},
+        timeout=10,
+    )
+    missing_prompt = request_json(
+        "POST",
+        "/chat",
+        body={"prompt": "", "timeout": 10},
+        timeout=10,
+    )
+    ok7 = bool(
+        bad_method.status != 200
+        and bad_json.status in {400, 503}
+        and missing_prompt.status in {400, 503}
+    )
+    record(
+        "error handling",
+        ok7,
+        f"GET /chat={bad_method.status}, missing prompt body={bad_json.status}/{bad_json.body!r}, empty prompt={missing_prompt.status}/{missing_prompt.body!r}",
+    )
+    if not ok7:
+        return 1
+
+    print("\n=== Test 8: Metrics accumulate ===")
+    health_after = parse_health()
+    requests_after = health_after.get("requests", {}) if isinstance(health_after, dict) else {}
+    total_after = int(requests_after.get("total", 0))
+    success_after = int(requests_after.get("success", 0))
+    ok8 = bool(total_after > baseline_total and success_after > baseline_success)
+    record(
+        "metrics accumulate",
+        ok8,
+        f"requests.total: {baseline_total} → {total_after}; success: {baseline_success} → {success_after}",
+    )
+    if not ok8:
+        return 1
+
+    print("\n=== Summary ===")
+    for name, ok, detail in results:
+        status = "OK " if ok else "FAIL"
+        print(f"  [{status}]  {name}" + (f" — {detail}" if not ok else ""))
+
+    print(f"\nPassed: {passed}/{len(results)}   Failed: {failed}")
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
