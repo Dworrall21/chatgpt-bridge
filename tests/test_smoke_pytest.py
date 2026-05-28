@@ -131,3 +131,38 @@ def test_fresh_session_navigation_contract_is_background_owned():
     assert "freshChatUrlFor" in background_src
     assert "connectedTabs.delete(tab.id)" in background_src
     assert 'injectContentScript(tab.id, "conversation-navigation")' in background_src
+    assert 'await injectIfMissing(tab, "send-miss")' in background_src
+    assert 'await injectIfMissing(tab.id, "send-miss")' not in background_src
+
+
+def test_content_js_type_helpers_receive_input():
+    src = (REPO_ROOT / "content.js").read_text()
+    assert "async function typeText(text, input)" in src
+    assert "await typeText(prompt, input)" in src
+    assert "async function sendWithRetry(input" in src
+    assert "await sendWithRetry(input)" in src
+    assert "assistant_count: allAssistants.length" in src
+    assert "window.__chatgptBridgePortAlive" in src
+
+
+def test_upload_files_cdp_uses_to_thread_and_imports_websockets():
+    src = BRIDGE_PATH.read_text()
+    assert "async def upload_files_cdp(file_paths):" in src
+    assert "import websockets" in src  # inside function body
+    assert "await asyncio.to_thread(_find_chatgpt_tab_cdp)" in src
+
+
+def test_validate_local_file_path_blocks_system_file():
+    bridge = load_bridge_module()
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        # Create a file inside tmp and verify it's accepted
+        f = Path(tmp) / "test.jpg"
+        f.write_text("test")
+        result = bridge.validate_local_file_path(str(f))
+        assert result == str(f.resolve())
+
+    # System files outside home should be rejected
+    import pytest
+    with pytest.raises(ValueError):
+        bridge.validate_local_file_path("/etc/passwd")

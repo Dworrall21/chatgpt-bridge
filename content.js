@@ -4,7 +4,7 @@
 // Supports streaming: sends intermediate text deltas via chrome.runtime.sendMessage.
 
 (function () {
-  if (window.__chatgptBridgeLoaded) return;
+  if (window.__chatgptBridgeLoaded && window.__chatgptBridgePortAlive) return;
   window.__chatgptBridgeLoaded = true;
 
   console.log("[ChatGPT Bridge] Content script loaded on", location.host);
@@ -16,13 +16,16 @@
   let port = null;
   try {
     port = chrome.runtime.connect({ name: "chatgpt-bridge-content-script" });
+    window.__chatgptBridgePortAlive = true;
     console.log("[ChatGPT Bridge] alive port opened");
   } catch (_) {
     console.warn("[ChatGPT Bridge] could not open alive port — injection may be unreliable");
+    window.__chatgptBridgePortAlive = false;
   }
 
   if (port) {
     port.onDisconnect.addListener(() => {
+      window.__chatgptBridgePortAlive = false;
       console.warn(
         "[ChatGPT Bridge] alive port disconnected — background will re-inject on next cycle"
       );
@@ -425,7 +428,7 @@
   // small delays ensures the editor properly tracks input state.
   const TYPING_DELAY_MS = 24; // 500 WPM
 
-  async function typeText(text) {
+  async function typeText(text, input) {
     for (let i = 0; i < text.length; i++) {
       const char = text[i];
       // Dispatch a real keyboard event for each character
@@ -448,7 +451,7 @@
   // Wait for the send button to become available, with retries.
   // Verifies the message was actually sent by checking for a new user message.
   // Returns true if sent successfully, false otherwise.
-  async function sendWithRetry(maxRetries = 5, retryDelayMs = 1000) {
+  async function sendWithRetry(input, maxRetries = 5, retryDelayMs = 1000) {
     // Count user messages before sending
     const userMessagesBefore = document.querySelectorAll(
       '[data-message-author-role="user"]'
@@ -597,14 +600,14 @@
       await sleep(100);
 
       // Type at 500 WPM (~24ms per character)
-      await typeText(prompt);
+      await typeText(prompt, input);
 
       input.dispatchEvent(new Event("input", { bubbles: true }));
       input.dispatchEvent(new Event("change", { bubbles: true }));
       await sleep(500);
 
       // Send with retry — wait for send button to become available
-      const sent = await sendWithRetry();
+      const sent = await sendWithRetry(input);
       if (!sent) throw new Error("Failed to send: send button not available");
 
       try {
@@ -743,7 +746,7 @@
               interval_ms: intervalMs,
               poll_index: pollCount,
               text_changed: textChanged,
-              assistant_count: assistants.length,
+              assistant_count: allAssistants.length,
               generating: isGenerating(),
               text_length: text ? text.length : 0,
               stable_count: stableCount,

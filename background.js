@@ -476,7 +476,7 @@ async function handleBridgePrompt(data) {
     }
 
     // Ensure content script is present before sending (handles fresh navigation too)
-    await injectIfMissing(tab.id, "send-miss");
+    await injectIfMissing(tab, "send-miss");
 
     let lastError = null;
     for (let attempt = 0; attempt < 2; attempt++) {

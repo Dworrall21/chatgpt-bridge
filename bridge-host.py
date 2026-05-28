@@ -110,6 +110,34 @@ def sanitize_url_for_logging(url):
         return "<invalid url>"
 
 
+def validate_local_file_path(raw_path):
+    """Return resolved local file path string, or raise ValueError."""
+    if not raw_path:
+        raise ValueError("Empty file path")
+
+    path = str(raw_path)
+    if path.startswith("file://"):
+        path = path[7:]
+
+    # Reject remote URLs here. Remote URL download/upload is not implemented.
+    parsed = urlparse(path)
+    if parsed.scheme in {"http", "https"}:
+        raise ValueError(f"Remote file URLs are not supported for upload: {sanitize_url_for_logging(path)}")
+
+    p = Path(path).expanduser().resolve()
+
+    allowed_roots = [Path.home().resolve(), Path("/tmp").resolve()]
+    if not any(p == root or root in p.parents for root in allowed_roots):
+        raise ValueError(f"File path is outside allowed roots: {p}")
+
+    if not p.exists():
+        raise ValueError(f"File not found: {p}")
+    if not p.is_file():
+        raise ValueError(f"Not a regular file: {p}")
+
+    return str(p)
+
+
 def _is_truthy(value):
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -677,7 +705,8 @@ async def cdp_eval(ws, expression, timeout_s=10):
 
 
 async def upload_files_cdp(file_paths):
-    page_id, page_url = _find_chatgpt_tab_cdp()
+    import websockets
+    page_id, page_url = await asyncio.to_thread(_find_chatgpt_tab_cdp)
     if not page_id:
         return False, "No ChatGPT tab found. Open https://chatgpt.com/ and ensure Chrome is running with --remote-debugging-port=9222"
     resolved = []
@@ -1077,18 +1106,16 @@ async def main():
         if not user_msgs:
             return web.json_response({"error": {"message": "No user message found", "type": "invalid_request_error"}}, status=400)
 
+        cdp_file_paths = []
+
         for _u in body.get("files", []):
             fp = _u if isinstance(_u, str) else _u.get("path", _u.get("url", ""))
-            if fp.startswith("file://"):
-                fp = fp[7:]
-            if fp.startswith("/") or (len(fp) > 1 and fp[1] == ":"):
-                if not is_trusted_url(fp):
-                    _safe = sanitize_url_for_logging(fp)
-                    log.warning("ssrf_blocked_file", extra={"url": _safe})
-                    return web.json_response({"error": {"message": f"URL not allowed: {_safe}", "type": "invalid_request_error"}}, status=400)
-                break
+            try:
+                cdp_file_paths.append(validate_local_file_path(fp))
+            except ValueError as e:
+                return web.json_response({"error": {"message": str(e), "type": "invalid_request_error"}}, status=400)
 
-        prompt_parts = []; cdp_file_paths = []
+        prompt_parts = []; cdp_file_paths_from_images = []
         for m in messages:
             role = m.get("role", "user")
             content = m.get("content", "")
@@ -1099,18 +1126,22 @@ async def main():
                         text_parts.append(p.get("text", ""))
                     elif p.get("type") == "image_url":
                         url = p.get("image_url", {}).get("url", "")
-                        if url.startswith("file://"):
-                            cdp_file_paths.append(url[7:])
-                        elif url.startswith("/") or (len(url) > 1 and url[1] == ":"):
-                            cdp_file_paths.append(url)
+                        if url.startswith("file://") or url.startswith("/") or (len(url) > 1 and url[1] == ":"):
+                            try:
+                                cdp_file_paths_from_images.append(validate_local_file_path(url))
+                            except ValueError as e:
+                                return web.json_response({"error": {"message": str(e), "type": "invalid_request_error"}}, status=400)
                 content = " ".join(text_parts)
             prompt_parts.append(f"{role}: {content}")
 
         for f in body.get("files", []):
             fp = f if isinstance(f, str) else f.get("path", f.get("url", ""))
-            if fp.startswith("file://"):
-                fp = fp[7:]
-            cdp_file_paths.append(fp)
+            try:
+                cdp_file_paths_from_images.append(validate_local_file_path(fp))
+            except ValueError as e:
+                return web.json_response({"error": {"message": str(e), "type": "invalid_request_error"}}, status=400)
+
+        cdp_file_paths = cdp_file_paths_from_images
 
         full_prompt = "\n".join(prompt_parts)
         prompt_chars = len(full_prompt)
@@ -1357,9 +1388,10 @@ async def main():
             file_paths = []
             for f in files:
                 fp = f if isinstance(f, str) else f.get("path", f.get("url", ""))
-                if fp.startswith("file://"):
-                    fp = fp[7:]
-                file_paths.append(fp)
+                try:
+                    file_paths.append(validate_local_file_path(fp))
+                except ValueError as e:
+                    return web.json_response({"success": False, "error": str(e)}, status=400)
             log.info("cdp_upload_begin", extra={"queue_len": len(file_paths)})
             ok, err = await upload_files_cdp(file_paths)
             if not ok:
@@ -1615,6 +1647,13 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Recursively clean __pycache__ before any Python bytecode compilation
+    import shutil
+    _script_root = Path(__file__).parent.resolve()
+    for _p in _script_root.rglob("__pycache__"):
+        if _p.is_dir():
+            shutil.rmtree(_p, ignore_errors=True)
+
     parser = argparse.ArgumentParser(description="ChatGPT Bridge Host")
     _cli_log_level = type("_ns", (), {})()
     parser.add_argument("--log-level", default="WARNING",
