@@ -111,13 +111,51 @@ chatgpt-extension/
 ├── background.js           # Service worker: WebSocket + injection
 ├── content.js              # DOM interaction (input, send, response)
 ├── bridge-host.py          # Python HTTP + WS bridge server
+├── cleanup-test-chats.py   # CDP-based test conversation cleanup
 ├── chatgpt-cdp.py          # Standalone CDP file upload script
 ├── chatgpt-chat            # Bash CLI wrapper
 ├── chatgpt-bridge          # Hermes CLI wrapper
 ├── start-chrome.sh         # Chrome launcher + watchdog
 ├── dom-selectors.md        # ChatGPT DOM reference
 ├── DEVELOPMENT.md          # Internal development notes
-└── .hermes/                # Audit logs, capability maps
+├── docs/
+│   ├── review-20260528.md  # Full code review and fix plan
+│   └── skills/             # Hermes skill documentation (see below)
+├── harnesses/              # Mapped interaction flows
+├── tests/                  # Unit and smoke tests
+└── scratch/                # Experiment scripts (gitignored data artifacts)
+```
+
+## Skills Documentation
+
+The `docs/skills/` directory contains the Hermes Agent skills associated with this project:
+
+- **[chatgpt-bridge.md](docs/skills/chatgpt-bridge.md)** — Core ChatGPT bridge skill: setup, architecture, pitfalls, session management, CDP interaction patterns, deep research extraction, and full reference index.
+- **[browser-bridge-extension.md](docs/skills/browser-bridge-extension.md)** — Generic browser bridge pattern: extension design, CSP considerations, CDP-direct alternative, port conventions, and common pitfalls.
+
+These skills are loaded by Hermes Agent to provide domain knowledge when working with the ChatGPT bridge.
+
+## Cleaning Up Test Conversations
+
+Test prompts should be prefixed with `[bridge-test]` so they're identifiable for batch cleanup:
+
+```bash
+curl -X POST http://127.0.0.1:11557/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"[bridge-test] Reply with exactly: ok","timeout":30}'
+```
+
+To list, find, or delete test conversations:
+
+```bash
+# List all sidebar conversations
+python3 cleanup-test-chats.py --list
+
+# Delete conversations matching a title pattern
+python3 cleanup-test-chats.py --find "[bridge-test]"
+
+# Delete specific conversations by ID
+python3 cleanup-test-chats.py --ids <conv-id-1> <conv-id-2>
 ```
 
 ## Ports
@@ -136,7 +174,7 @@ chatgpt-extension/
 | `503 No ChatGPT tab` | No chatgpt.com tab open | Open chatgpt.com in debug Chrome |
 | `504 Gateway Timeout` | Prompt timed out | Increase `timeout` param |
 | `ERR_CONNECTION_REFUSED` | Bridge not running | `python3 bridge-host.py` |
-| `__pycache__` load error | Stale cache dir | `rm -rf __pycache__` (auto-cleaned on bridge start) |
+| `__pycache__` load error | Stale cache dir | `find ... -name __pycache__ -exec rm -rf {} +` (auto-cleaned) |
 
 ## Development
 
