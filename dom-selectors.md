@@ -174,13 +174,40 @@ ID:          radix-_r_5_ (dynamic)
 Text:        "Extended"
 ```
 
+### Model Configure Menu Item (after clicking pill)
+```
+Selector:    [data-testid="model-configure-modal"]
+Tag:         DIV
+role:        menuitem
+Text:        "Configure..."
+Stability:   HIGH
+```
+
+### Intelligence / Model Selection Modal
+```
+Selector:    [data-testid="modal-intelligence-menu"]
+Tag:         DIV
+Text:        "IntelligenceModel5.5InstantFor everyday chatsThinkingFor complex questionsPro..."
+Stability:   HIGH
+```
+
+### Model Radio Buttons (inside modal)
+```
+Selector:    [data-testid="modal-intelligence-menu"] button[role="radio"]
+Tag:         BUTTON
+role:        radio
+Options:     "Instant 5.3 For everyday chats", "Thinking 5.4 For complex questions"
+Stability:   HIGH
+```
+
 ### Notes
 - ChatGPT does not display the model name (e.g., "GPT-4o") prominently in the main chat UI.
-- Instead, a pill button in the composer shows the current mode (e.g., "Extended" for extended thinking, or model-specific pills).
-- The model selector dropdown is likely accessible by clicking this pill.
-- The pill ID is dynamic (`radix-_r_*`) and changes on every render.
-- **No stable data-testid** was found for the model selector.
-- The sidebar may contain conversation titles that include model names (e.g., "Gemini model selection"), but these are conversation history items, not the active model selector.
+- Instead, a pill button in the composer shows the current mode (e.g., "Thinking", "Instant").
+- **The pill uses Radix UI dynamic IDs** (`#radix-_r_*`) — NEVER rely on these.
+- The model switching flow is: click pill → click "Configure..." (`data-testid="model-configure-modal"`) → modal opens (`data-testid="modal-intelligence-menu"`) → click radio button.
+- The Configure menu item and modal both have stable `data-testid` attributes. Use those.
+- Available models depend on subscription tier (Free/Plus/Pro).
+- Modal closes automatically after selection.
 
 ---
 
@@ -220,23 +247,41 @@ Class:       sr-only
 
 ## 9. File Upload
 
-### File Inputs
+### Plus / Attachment Button (opens menu)
+```
+Selector:    [data-testid="composer-plus-btn"]
+Tag:         BUTTON
+aria-label:  "Add files and more"
+Stability:   HIGH
+```
+
+### File Upload Menu Items
+```
+"Add photos & files"  — triggers file picker (Ctrl+U shortcut)
+"Recent files"        — shows recent uploads
+```
+Note: Menu items are Radix-based with dynamic IDs. Match by text content or `role="menuitem"`.
+
+### File Inputs (hidden, programmatic only)
 ```
 Selector:    input#upload-files
 Type:        file
-```
 
-```
 Selector:    input#upload-photos
 Type:        file
 Class:       sr-only select-none
-```
 
-```
 Selector:    input#upload-camera
 Type:        file
 Class:       sr-only select-none
 ```
+
+### Notes
+- The plus button `[data-testid="composer-plus-btn"]` is the primary entry point for file uploads.
+- Clicking "Add photos & files" opens a native OS file picker — cannot automate via DOM.
+- To upload programmatically, set files directly on `input#upload-files` via CDP `DOM.setFileInputFiles` or DataTransfer API.
+- After file is attached, the send button `[data-testid="send-button"]` appears.
+- File preview shows in the composer area before sending.
 
 ---
 
@@ -260,6 +305,42 @@ Selector:    div[aria-label="Open profile menu"]
 Class:       group __menu-item hoverable gap-2 ms-2 me-1.5 gap-2! pe-1.5 data-fill:max-w-full [&>div:first-child]:gap-2!
 ```
 
+### Conversation Options Button (per-item)
+```
+Selector:    [data-testid="history-item-N-options"]
+Tag:         BUTTON
+aria-label:  "Open conversation options for TITLE"
+N:           0-indexed position in sidebar list
+Stability:   HIGH
+```
+
+### Conversation Options Menu Items
+```
+"Rename"   — opens inline title editor
+"Delete"   — removes conversation (may show confirmation)
+"Archive"  — moves to archive
+"Share"    — share options
+```
+Note: Menu items are Radix-based with dynamic IDs. Match by text content or `role="menuitem"`.
+
+### Rename Input (inline in sidebar)
+```
+Selector:    input[aria-label="Chat title"]
+Tag:         INPUT
+Type:        text
+Stability:   HIGH
+```
+- Appears inline replacing the conversation title
+- Enter confirms, Escape cancels
+- After confirm, `aria-label` on conversation link updates to new title
+
+### Sidebar Conversation Links
+```
+Selector:    #history a[aria-label="CONVERSATION_TITLE"]
+Tag:         A
+Stability:   MEDIUM (title changes after rename)
+```
+
 ---
 
 ## Summary Table
@@ -275,6 +356,18 @@ Class:       group __menu-item hoverable gap-2 ms-2 me-1.5 gap-2! pe-1.5 data-fi
 | Model Pill       | `.__composer-pill`                                   | —                                        |
 | Composer Form    | `form.group\\/composer`                             | `form`                                   |
 | Sidebar Toggle   | `button[aria-label="Open sidebar"]`                  | —                                        |
+| Close Sidebar    | `[data-testid="close-sidebar-button"]`               | —                                        |
+| Model Pill       | `button.__composer-pill`                              | Text match ("Thinking"/"Instant")        |
+| Configure Menu   | `[data-testid="model-configure-modal"]`               | `div[role="menuitem"]` with "Configure"  |
+| Model Modal      | `[data-testid="modal-intelligence-menu"]`             | —                                        |
+| Model Radio      | `[data-testid="modal-intelligence-menu"] button[role="radio"]` | —                               |
+| Conversation Turn| `[data-testid="conversation-turn-N"]`                 | —                                        |
+| Stop Button      | `[data-testid="stop-button"]`                         | —                                        |
+| Plus/Attach Btn  | `[data-testid="composer-plus-btn"]`                   | `button[aria-label="Add files and more"]` |
+| File Input       | `input#upload-files`                                  | `input#upload-photos`                    |
+| Conv Options Btn | `[data-testid="history-item-N-options"]`              | `button[aria-label="Open conversation options for TITLE"]` |
+| Rename Input     | `input[aria-label="Chat title"]`                      | —                                        |
+| Conv Link        | `#history a[aria-label="TITLE"]`                      | —                                        |
 
 ---
 

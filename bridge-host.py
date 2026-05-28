@@ -38,6 +38,13 @@ HTTP_PORT = 11557
 WS_PORT   = 11558
 CDP_PORT  = 9222
 
+# Default to ChatGPT Temporary Chat for Hermes/provider calls. Temporary Chat is
+# the ChatGPT-side privacy boundary: it does not use saved account memories and
+# does not create/update user memory from the conversation. Set
+# CHATGPT_BRIDGE_PRIVACY_MODE=standard to opt out for manual/default bridge use.
+DEFAULT_PRIVACY_MODE = os.getenv("CHATGPT_BRIDGE_PRIVACY_MODE", "temporary").strip().lower()
+TEMPORARY_CHAT_URL = os.getenv("CHATGPT_BRIDGE_TEMPORARY_CHAT_URL", "https://chatgpt.com/?temporary-chat=true")
+
 # ─── SSRF Protection ───
 _TRUSTED_URL_HOSTS = frozenset({
     "chatgpt.com",
@@ -382,11 +389,14 @@ class BridgeState:
             return {"conversation_id": stored, "conversation_title": None}
         return None
 
-    def set_conversation(self, session_key, conversation_id, conversation_title=None):
+    def set_conversation(self, session_key, conversation_id, conversation_title=None, privacy_mode=None):
         key = str(session_key or "default")
         sessions = dict(self.conversation_sessions)
         if conversation_id:
-            sessions[key] = {"conversation_id": conversation_id, "conversation_title": conversation_title}
+            entry = {"conversation_id": conversation_id, "conversation_title": conversation_title}
+            if privacy_mode:
+                entry["privacy_mode"] = _normalize_privacy_mode(privacy_mode)
+            sessions[key] = entry
         else:
             sessions.pop(key, None)
         self._data["conversation_sessions"] = sessions
@@ -510,6 +520,24 @@ def _catalog_payload(state):
     }
 
 
+def _normalize_privacy_mode(value):
+    mode = str(value or DEFAULT_PRIVACY_MODE or "temporary").strip().lower().replace("_", "-")
+    if mode in {"temporary", "temp", "temporary-chat", "no-memory", "private", "privacy"}:
+        return "temporary"
+    if mode in {"standard", "normal", "default", "off", "false", "0", "none"}:
+        return "standard"
+    return "temporary"
+
+
+def _resolve_privacy_mode(body):
+    if isinstance(body, dict):
+        if _is_truthy(body.get("temporary_chat", False)) or _is_truthy(body.get("no_memory", False)):
+            return "temporary"
+        if "privacy_mode" in body:
+            return _normalize_privacy_mode(body.get("privacy_mode"))
+    return _normalize_privacy_mode(DEFAULT_PRIVACY_MODE)
+
+
 def _conversation_session_key(body):
     if not isinstance(body, dict):
         return "default"
@@ -520,8 +548,9 @@ def _conversation_session_key(body):
     return "default"
 
 
-def _resolve_conversation_state(state, body):
+def _resolve_conversation_state(state, body, *, allow_default_fallback=True):
     session_key = _conversation_session_key(body)
+    privacy_mode = _resolve_privacy_mode(body)
     wants_new = _is_truthy(body.get("new", False))
     explicit_id = body.get("conversation_id") or None
 
@@ -530,9 +559,32 @@ def _resolve_conversation_state(state, body):
     if wants_new:
         return session_key, None, True, False
 
+    # For API callers that did not provide a session key, do not reuse any
+    # default/global pin unless the endpoint explicitly allows it. This prevents
+    # a fresh Hermes session from inheriting an unrelated old ChatGPT thread.
+    if session_key == "default" and not allow_default_fallback:
+        return session_key, None, False, False
+
     stored = state.get_conversation(session_key)
     if stored and stored.get("conversation_id"):
-        return session_key, stored.get("conversation_id"), False, False
+        stored_privacy = _normalize_privacy_mode(stored.get("privacy_mode") or "standard")
+        if privacy_mode == stored_privacy:
+            return session_key, stored.get("conversation_id"), False, False
+
+    # A non-default session key is authoritative: if it has no pin yet, start a
+    # fresh ChatGPT thread and then persist the returned conversation_id.
+    if session_key != "default":
+        return session_key, None, False, False
+
+    # OpenAI-compatible providers like Hermes send the whole message transcript
+    # on every request. If they do not send a session_id, falling back to a
+    # process-global last_conversation_id can leak an unrelated old ChatGPT
+    # thread into a new local session. Keep the legacy default fallback only for
+    # explicit CLI/default-session callers that opted into it and only for the
+    # standard non-temporary mode, because legacy global pins predate privacy
+    # metadata and may be regular memory-enabled ChatGPT conversations.
+    if not allow_default_fallback or privacy_mode != "standard":
+        return session_key, None, False, False
 
     return session_key, state.last_conversation_id or None, False, False
 
@@ -736,6 +788,7 @@ async def main():
     counter = 0
     ws_lock = asyncio.Lock()
     extension_connected_since = None
+    conversation_lock = asyncio.Lock()  # protects resolve-store cycle for session→conversation mapping
 
     per_assignee_requests = {}  # assignee -> {total, success, timeout, error}
     watchdog_events = []       # last 20 watchdog recovery event dicts
@@ -773,11 +826,11 @@ async def main():
                 if mtype == "response":
                     rid = msg.get("id")
                     if rid in pending:
-                        meta = {}
+                        meta = pending_meta.get(rid, {}) or {}
                         conv_id = msg.get("conversation_id")
                         conv_title = msg.get("conversation_title")
                         if conv_id:
-                            meta = {"conversation_id": conv_id, "conversation_title": conv_title}
+                            meta.update({"conversation_id": conv_id, "conversation_title": conv_title})
                         debug_info = msg.get("_debug")
                         if debug_info:
                             meta["_debug"] = debug_info
@@ -818,6 +871,13 @@ async def main():
                 elif mtype == "done":
                     rid = msg.get("id")
                     if rid in stream_queues:
+                        # Store conversation_id from the done message so streaming
+                        # sessions can pin the ChatGPT thread for subsequent turns.
+                        conv_id = msg.get("conversation_id")
+                        conv_title = msg.get("conversation_title")
+                        log.info("ws_done", extra={"rid": rid, "conv_id": conv_id, "has_meta": rid in pending_meta})
+                        if conv_id and rid in pending_meta:
+                            pending_meta[rid].update({"conversation_id": conv_id, "conversation_title": conv_title})
                         await stream_queues[rid].put({"type": "done"})
                         del stream_queues[rid]
 
@@ -989,19 +1049,24 @@ async def main():
                 return web.json_response({"error": {"message": str(e), "type": "server_error"}}, status=503)
             resolved_model, available_models = _resolve_model_search_or_404(model_search)
             if resolved_model is None:
-                return web.json_response({
-                    "error": {
-                        "message": f"Model not found: {model_search}",
-                        "type": "model_not_found",
-                        "available_models": _format_model_catalog(available_models, state.available_models_fetched_at),
-                    }
-                }, status=404)
-            model_search = resolved_model
+                # Model not found in catalog — clear model_search so the request
+                # still proceeds with whatever model ChatGPT has selected.
+                # Returning 404 here causes Hermes to retry with different model
+                # names, creating duplicate requests that flood the bridge.
+                log.warning("model_not_found_falling_back", extra={"model_search": model_search, "count": len(available_models)})
+                model_search = None
+            else:
+                model_search = resolved_model
         stream = body.get("stream", False)
         debug = _is_truthy(request.rel_url.query.get("debug") or body.get("debug", False))
+        privacy_mode = _resolve_privacy_mode(body)
         request_id = request.get("request_id")
         request_started_at = time.time()
-        session_key, conversation_id, new_conversation, explicit_conversation = _resolve_conversation_state(state, body)
+        session_key, conversation_id, new_conversation, explicit_conversation = _resolve_conversation_state(
+            state,
+            body,
+            allow_default_fallback=False,
+        )
         if new_conversation and not explicit_conversation:
             state.clear_conversation(session_key)
         timeout_s = body.get("timeout", 10)
@@ -1081,110 +1146,142 @@ async def main():
                         "status": "started",
                         "code": "v1/chat/completions"})
 
+        # Use the resolved new_conversation flag from _resolve_conversation_state
+        # instead of recalculating from conversation_id. This prevents a race where
+        # concurrent requests for the same new session all see conversation_id=None
+        # and each start a fresh ChatGPT conversation.
         msg_data = {
             "type": "prompt",
             "id": rid, "prompt": full_prompt, "options": {},
             "files": [], "timeout": timeout_s,
             "conversation_id": conversation_id, "model_search": model_search,
+            "new_conversation": new_conversation,
+            "privacy_mode": privacy_mode,
+            "temporary_chat_url": TEMPORARY_CHAT_URL,
             "debug": debug,
         }
 
-        if stream:
-            stream_queue = asyncio.Queue()
-            stream_queues[rid] = stream_queue; created_at = time.time()
-            async def sse_generator():
-                try:
-                    while True:
-                        hard_elapsed = time.time() - created_at
-                        if hard_elapsed >= timeout_s:
-                            break
-                        try:
-                            item = await asyncio.wait_for(stream_queue.get(), timeout=min(1.0, max(timeout_s - hard_elapsed, 0.1)))
-                        except asyncio.TimeoutError:
-                            continue
-                        if item["type"] == "done":
-                            yield "data: [DONE]\n\n"; break
-                        elif item["type"] == "delta":
-                            payload_ = {"id": rid, "object": "chat.completion.chunk",
-                                        "created": int(time.time()), "model": model,
-                                        "choices": [{"index": 0, "delta": {"content": item["content"]}, "finish_reason": None}]}
-                            yield f"data: {json.dumps(payload_)}\n\n"
-                except Exception:
-                    pass
-                finally:
-                    stream_queues.pop(rid, None); pending.pop(rid, None); pending_meta.pop(rid, None)
-            try:
-                await _send_to_extension(msg_data)
-            except Exception as e:
-                stream_queues.pop(rid, None)
-                log.error("stream_send_error", extra={"rid": rid, "error": str(e)})
-                failed_requests += 1; _incr_assignee(assignee, "error")
-                return web.json_response({"error": {"message": str(e), "type": "server_error"}}, status=500)
-            response = web.StreamResponse(
-                status=200,
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
-                         "Content-Type": "text/event-stream", "X-Accel-Buffering": "no",
-                         "Access-Control-Allow-Origin": "*"})
-            response.headers["X-Request-Id"] = request_id
-            await response.prepare(request)
-            async for chunk in sse_generator():
-                await response.write(chunk.encode())
-            await response.write_eof()
-            _stream_elapsed = round((time.time() - created_at) * 1000)
-            log.info("response_received",
-                     extra={"rid": rid,
-                            "type": "/v1/chat/completions",
-                            "prompt_chars": prompt_chars,
-                            "response_chars": 0,
-                            "elapsed_ms": _stream_elapsed,
-                            "status": "ok"})
-            return response
+        # Serialize prompt delivery through conversation_lock so that concurrent
+        # requests for the same session don't each create a new ChatGPT thread.
+        # The lock spans resolve → send → store so the first request's
+        # conversation_id is stored before the next request resolves.
+        async with conversation_lock:
 
-        # non-streaming path
-        pending[rid] = future = asyncio.get_event_loop().create_future()
-        pending_meta[rid] = {"session_key": session_key, "conversation_id": conversation_id, "conversation_title": None}
-        try:
-            result, ws_send_ms = await _send_and_wait(msg_data, timeout_s, rid, prompt_chars=prompt_chars, req_type="/v1/chat/completions")
-            pending.pop(rid, None)
-            meta = pending_meta.pop(rid, {})
-            conv_id = meta.get("conversation_id"); conv_title = meta.get("conversation_title")
-            session_key_meta = meta.get("session_key") or session_key
-            if conv_id:
-                state.set_conversation(session_key_meta, conv_id, conv_title)
-                state.last_conversation_id = conv_id
-                state.last_conversation_title = conv_title
-            successful_requests += 1; last_response_time = time.strftime("%H:%M:%S")
-            _incr_assignee(assignee, "success")
-            response_chars = len(result)
-            completion_id = f"chatcmpl-{int(time.time())}"
-            assistant_text = result
-            resp = {"id": completion_id, "object": "chat.completion",
-                    "created": int(time.time()), "model": model,
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": assistant_text},
-                                 "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": prompt_chars // 4,
-                              "completion_tokens": response_chars // 4,
-                              "total_tokens": (prompt_chars + response_chars) // 4}}
-            if conv_id: resp["conversation_id"] = conv_id
-            if conv_title: resp["conversation_title"] = conv_title
-            if debug:
-                resp["_debug"] = _build_debug({"_debug": meta.get("_debug")}, ws_send_ms, request_started_at)
-                log.info("poll_summary", extra={"rid": rid, "request_id": request_id, "count": resp["_debug"].get("poll_count"), "detail": f"intervals={resp['_debug'].get('poll_intervals_ms')}"})
-            log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/v1/chat/completions", "status": "ok"})
-            return web.json_response(resp)
-        except asyncio.TimeoutError:
-            pending.pop(rid, None); pending_meta.pop(rid, None)
-            timed_out_requests += 1; _incr_assignee(assignee, "timeout")
-            log.warning("request_timeout", extra={"rid": rid, "request_id": request_id, "status": "timeout",
-                                                  "elapsed_ms": timeout_s * 1000})
-            log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/v1/chat/completions", "status": "timeout"})
-            return web.json_response({"error": {"message": f"Timed out ({timeout_s}s)", "type": "timeout"}}, status=504)
-        except Exception as e:
-            pending.pop(rid, None); pending_meta.pop(rid, None)
-            failed_requests += 1; _incr_assignee(assignee, "error")
-            log.error("request_error", extra={"rid": rid, "request_id": request_id, "status": "error", "error": str(e)})
-            log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/v1/chat/completions", "status": "error"})
-            return web.json_response({"error": {"message": str(e), "type": "server_error"}}, status=500)
+            if stream:
+                stream_queue = asyncio.Queue()
+                stream_queues[rid] = stream_queue; created_at = time.time()
+                async def sse_generator():
+                    try:
+                        while True:
+                            hard_elapsed = time.time() - created_at
+                            if hard_elapsed >= timeout_s:
+                                break
+                            try:
+                                item = await asyncio.wait_for(stream_queue.get(), timeout=min(1.0, max(timeout_s - hard_elapsed, 0.1)))
+                            except asyncio.TimeoutError:
+                                continue
+                            if item["type"] == "done":
+                                yield "data: [DONE]\n\n"; break
+                            elif item["type"] == "delta":
+                                payload_ = {"id": rid, "object": "chat.completion.chunk",
+                                            "created": int(time.time()), "model": model,
+                                            "choices": [{"index": 0, "delta": {"content": item["content"]}, "finish_reason": None}]}
+                                yield f"data: {json.dumps(payload_)}\n\n"
+                    except Exception:
+                        pass
+                    finally:
+                        stream_queues.pop(rid, None)
+                        # Note: pending_meta is NOT popped here — the outer code
+                        # needs to read conversation_id from it after streaming completes.
+                try:
+                    await _send_to_extension(msg_data)
+                except Exception as e:
+                    stream_queues.pop(rid, None)
+                    log.error("stream_send_error", extra={"rid": rid, "error": str(e)})
+                    failed_requests += 1; _incr_assignee(assignee, "error")
+                    return web.json_response({"error": {"message": str(e), "type": "server_error"}}, status=500)
+                response = web.StreamResponse(
+                    status=200,
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                             "Content-Type": "text/event-stream", "X-Accel-Buffering": "no",
+                             "Access-Control-Allow-Origin": "*"})
+                response.headers["X-Request-Id"] = request_id
+                await response.prepare(request)
+                async for chunk in sse_generator():
+                    await response.write(chunk.encode())
+                await response.write_eof()
+                _stream_elapsed = round((time.time() - created_at) * 1000)
+                log.info("response_received",
+                         extra={"rid": rid,
+                                "type": "/v1/chat/completions",
+                                "prompt_chars": prompt_chars,
+                                "response_chars": 0,
+                                "elapsed_ms": _stream_elapsed,
+                                "status": "ok"})
+                # Store conversation_id from the streaming response
+                # (populated by the "done" WS message from the extension)
+                meta = pending_meta.pop(rid, {}) or {}
+                conv_id = meta.get("conversation_id")
+                conv_title = meta.get("conversation_title")
+                session_key_meta = meta.get("session_key") or session_key
+                privacy_mode_meta = meta.get("privacy_mode") or privacy_mode
+                log.info("stream_store", extra={"rid": rid, "conv_id": conv_id, "meta_keys": list(meta.keys())})
+                if conv_id:
+                    state.set_conversation(session_key_meta, conv_id, conv_title, privacy_mode=privacy_mode_meta)
+                    if privacy_mode_meta == "standard":
+                        state.last_conversation_id = conv_id
+                        state.last_conversation_title = conv_title
+                successful_requests += 1; last_response_time = time.strftime("%H:%M:%S")
+                _incr_assignee(assignee, "success")
+                return response
+
+            # non-streaming path
+            pending[rid] = future = asyncio.get_event_loop().create_future()
+            pending_meta[rid] = {"session_key": session_key, "conversation_id": conversation_id, "conversation_title": None, "privacy_mode": privacy_mode}
+            try:
+                result, ws_send_ms = await _send_and_wait(msg_data, timeout_s, rid, prompt_chars=prompt_chars, req_type="/v1/chat/completions")
+                pending.pop(rid, None)
+                meta = pending_meta.pop(rid, {})
+                conv_id = meta.get("conversation_id"); conv_title = meta.get("conversation_title")
+                session_key_meta = meta.get("session_key") or session_key
+                privacy_mode_meta = meta.get("privacy_mode") or privacy_mode
+                if conv_id:
+                    state.set_conversation(session_key_meta, conv_id, conv_title, privacy_mode=privacy_mode_meta)
+                    if privacy_mode_meta == "standard":
+                        state.last_conversation_id = conv_id
+                        state.last_conversation_title = conv_title
+                successful_requests += 1; last_response_time = time.strftime("%H:%M:%S")
+                _incr_assignee(assignee, "success")
+                response_chars = len(result)
+                completion_id = f"chatcmpl-{int(time.time())}"
+                assistant_text = result
+                resp = {"id": completion_id, "object": "chat.completion",
+                        "created": int(time.time()), "model": model,
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": assistant_text},
+                                     "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": prompt_chars // 4,
+                                  "completion_tokens": response_chars // 4,
+                                  "total_tokens": (prompt_chars + response_chars) // 4}}
+                if conv_id: resp["conversation_id"] = conv_id
+                if conv_title: resp["conversation_title"] = conv_title
+                if debug:
+                    resp["_debug"] = _build_debug({"_debug": meta.get("_debug")}, ws_send_ms, request_started_at)
+                    log.info("poll_summary", extra={"rid": rid, "request_id": request_id, "count": resp["_debug"].get("poll_count"), "detail": f"intervals={resp['_debug'].get('poll_intervals_ms')}"})
+                log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/v1/chat/completions", "status": "ok"})
+                return web.json_response(resp)
+            except asyncio.TimeoutError:
+                pending.pop(rid, None); pending_meta.pop(rid, None)
+                timed_out_requests += 1; _incr_assignee(assignee, "timeout")
+                log.warning("request_timeout", extra={"rid": rid, "request_id": request_id, "status": "timeout",
+                                                      "elapsed_ms": timeout_s * 1000})
+                log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/v1/chat/completions", "status": "timeout"})
+                return web.json_response({"error": {"message": f"Timed out ({timeout_s}s)", "type": "timeout"}}, status=504)
+            except Exception as e:
+                pending.pop(rid, None); pending_meta.pop(rid, None)
+                failed_requests += 1; _incr_assignee(assignee, "error")
+                log.error("request_error", extra={"rid": rid, "request_id": request_id, "status": "error", "error": str(e)})
+                log.info("response_end", extra={"rid": rid, "request_id": request_id, "type": "/v1/chat/completions", "status": "error"})
+                return web.json_response({"error": {"message": str(e), "type": "server_error"}}, status=500)
 
     # ─── /chat handler ──────────────────────────────────────────────────────
 
@@ -1218,8 +1315,7 @@ async def main():
                                 files.append(url)
                     content = " ".join(text_parts)
                 prompt_parts.append(f"{role}: {content}")
-            prompt = "
-".join(prompt_parts).strip()
+            prompt = "\n".join(prompt_parts).strip()
         assignee = body.get("assignee") or ""
         session_key, conversation_id, new_conversation, explicit_conversation = _resolve_conversation_state(state, body)
         model_search = body.get("model_search") or None
@@ -1240,6 +1336,7 @@ async def main():
                 }, status=404)
             model_search = resolved_model
         debug = _is_truthy(request.rel_url.query.get("debug") or body.get("debug", False))
+        privacy_mode = _resolve_privacy_mode(body)
         request_id = request.get("request_id")
         request_started_at = time.time()
         if new_conversation and not explicit_conversation:
@@ -1290,10 +1387,14 @@ async def main():
                         "status": "started",
                         "code": "/chat"})
         pending[rid] = future = asyncio.get_event_loop().create_future()
-        pending_meta[rid] = {"session_key": session_key, "conversation_id": conversation_id, "conversation_title": None}
+        pending_meta[rid] = {"session_key": session_key, "conversation_id": conversation_id, "conversation_title": None, "privacy_mode": privacy_mode}
+        # Use the resolved new_conversation flag from _resolve_conversation_state
         msg_data = {"type": "prompt", "id": rid, "prompt": prompt,
                     "options": options, "files": [], "timeout": timeout_s,
                     "conversation_id": conversation_id, "model_search": model_search,
+                    "new_conversation": new_conversation,
+                    "privacy_mode": privacy_mode,
+                    "temporary_chat_url": TEMPORARY_CHAT_URL,
                     "debug": debug}
         try:
             result, ws_send_ms = await _send_and_wait(msg_data, timeout_s, rid, prompt_chars=len(prompt), req_type="/chat")
@@ -1301,10 +1402,12 @@ async def main():
             meta = pending_meta.pop(rid, {})
             conv_id = meta.get("conversation_id"); conv_title = meta.get("conversation_title")
             session_key_meta = meta.get("session_key") or session_key
+            privacy_mode_meta = meta.get("privacy_mode") or privacy_mode
             if conv_id:
-                state.set_conversation(session_key_meta, conv_id, conv_title)
-                state.last_conversation_id = conv_id
-                state.last_conversation_title = conv_title
+                state.set_conversation(session_key_meta, conv_id, conv_title, privacy_mode=privacy_mode_meta)
+                if privacy_mode_meta == "standard":
+                    state.last_conversation_id = conv_id
+                    state.last_conversation_title = conv_title
             successful_requests += 1; last_response_time = time.strftime("%H:%M:%S")
             _incr_assignee(assignee, "success")
             response_chars = len(result)
@@ -1377,6 +1480,8 @@ async def main():
             "last_response": last_response_time,
             "last_conversation_id": state.last_conversation_id,
             "last_conversation_title": state.last_conversation_title,
+            "privacy_mode": _normalize_privacy_mode(DEFAULT_PRIVACY_MODE),
+            "temporary_chat_url": TEMPORARY_CHAT_URL if _normalize_privacy_mode(DEFAULT_PRIVACY_MODE) == "temporary" else None,
             "watchdog": {
                 "recovery_events": watchdog_summary.get("recovery_events", 0),
                 "last_recovery": watchdog_summary.get("last_recovery"),
@@ -1426,17 +1531,27 @@ async def main():
         except Exception:
             body = {}
         session_key = _conversation_session_key(body)
+        privacy_mode = _resolve_privacy_mode(body)
         previous = state.clear_conversation(session_key)
         if session_key == "default":
             state.last_conversation_id = None
             state.last_conversation_title = None
         previous_id = previous.get("conversation_id") if isinstance(previous, dict) else previous
+        if connected_extensions:
+            msg = {"type": "new_chat", "privacy_mode": privacy_mode, "temporary_chat_url": TEMPORARY_CHAT_URL}
+            async with ws_lock:
+                for ext in list(connected_extensions):
+                    try:
+                        await ext.send(json.dumps(msg))
+                    except Exception as e:
+                        log.warning("new_chat_send_error", extra={"error": str(e)})
         log.info("conversation_reset", extra={"rid": request.get("request_id"), "detail": previous_id})
         return web.json_response({
             "success": True,
             "message": "Conversation pin reset — next prompt starts a fresh ChatGPT conversation",
             "previous_conversation_id": previous_id,
             "session_id": session_key,
+            "privacy_mode": privacy_mode,
         })
 
     async def cors(request):

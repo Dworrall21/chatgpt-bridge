@@ -15,6 +15,7 @@ const HTTP_HEALTH_URL = "http://127.0.0.1:11557/health";
 const WS_URL = "ws://127.0.0.1:11558";
 const CHATGPT_URL_PATTERN = "https://chatgpt.com/*";
 const CHATGPT_URL_RE = /^https:\/\/chatgpt\.com\//;
+const DEFAULT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
 const PERIODIC_INJECT_INTERVAL_MS = 30_000; // bumped from 5s: watchdog handles post-disconnect
 
 let ws = null;
@@ -407,6 +408,42 @@ async function requestModelCatalog(reason = "manual", requestId = null) {
 
 // ── Bridge WebSocket ─────────────────────────────────────────────────────
 
+async function navigateTabAndWait(tabId, url, timeoutMs = 15000) {
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error("Navigation timed out"));
+    }, timeoutMs);
+    const listener = (changedTabId, changeInfo) => {
+      if (changedTabId === tabId && changeInfo.status === "complete") {
+        chrome.tabs.onUpdated.removeListener(listener);
+        clearTimeout(timeout);
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.update(tabId, { url });
+  });
+}
+
+function freshChatUrlFor(data = {}) {
+  return data.privacy_mode === "temporary"
+    ? (data.temporary_chat_url || DEFAULT_TEMPORARY_CHAT_URL)
+    : "https://chatgpt.com/";
+}
+
+async function handleBridgeNewChat(data = {}) {
+  const tab = await findChatGptTab();
+  if (!tab) {
+    throw new Error("No ChatGPT tab found. Open https://chatgpt.com/ in the debug Chrome profile.");
+  }
+  const url = freshChatUrlFor(data);
+  await navigateTabAndWait(tab.id, url);
+  connectedTabs.delete(tab.id);
+  await sleep(800);
+  await injectContentScript(tab.id, "new-chat");
+}
+
 async function handleBridgePrompt(data) {
   const id = data.id;
   try {
@@ -415,30 +452,31 @@ async function handleBridgePrompt(data) {
       throw new Error("No ChatGPT tab found. Open https://chatgpt.com/ in the debug Chrome profile.");
     }
 
-    // ── Navigate to the target conversation BEFORE sending to content script ──
+    // ── Navigate BEFORE sending to content script ────────────────────────
     // Using location.href inside the content script kills it and requires a slow
     // retry cycle. Instead, navigate the tab here and wait for it to finish loading.
-    const needNavigate = !!data.conversation_id && tab.url && !tab.url.includes(`/c/${data.conversation_id}`);
-    if (needNavigate) {
-      console.log(`[ChatGPT Bridge] navigating tab ${tab.id} to /c/${data.conversation_id}`);
-      await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error("Navigation timed out")), 15000);
-        const listener = (changedTabId, changeInfo) => {
-          if (changedTabId === tab.id && changeInfo.status === "complete") {
-            chrome.tabs.onUpdated.removeListener(listener);
-            clearTimeout(timeout);
-            resolve();
-          }
-        };
-        chrome.tabs.onUpdated.addListener(listener);
-        chrome.tabs.update(tab.id, { url: `https://chatgpt.com/c/${data.conversation_id}` });
-      });
-      // Small delay for content script injection after navigation
+    if (data.new_conversation) {
+      const freshUrl = freshChatUrlFor(data);
+      console.log(`[ChatGPT Bridge] navigating tab ${tab.id} to fresh chat (${data.privacy_mode || "standard"})`);
+      await navigateTabAndWait(tab.id, freshUrl);
+      connectedTabs.delete(tab.id); // old content script may be in bfcache after navigation
+      await sleep(800);
+      await injectContentScript(tab.id, "fresh-chat-navigation");
       await sleep(500);
+    } else {
+      const needNavigate = !!data.conversation_id && tab.url && !tab.url.includes(`/c/${data.conversation_id}`);
+      if (needNavigate) {
+        console.log(`[ChatGPT Bridge] navigating tab ${tab.id} to /c/${data.conversation_id}`);
+        await navigateTabAndWait(tab.id, `https://chatgpt.com/c/${data.conversation_id}`);
+        connectedTabs.delete(tab.id); // old content script may be in bfcache after navigation
+        await sleep(500);
+        await injectContentScript(tab.id, "conversation-navigation");
+        await sleep(500);
+      }
     }
 
     // Ensure content script is present before sending (handles fresh navigation too)
-    await injectIfMissing(tab, "send-miss");
+    await injectIfMissing(tab.id, "send-miss");
 
     let lastError = null;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -451,6 +489,8 @@ async function handleBridgePrompt(data) {
           timeout: data.timeout || 10,
           attempt: attempt,
           conversation_id: data.conversation_id || null,
+          new_conversation: !!data.new_conversation,
+          privacy_mode: data.privacy_mode || "standard",
           model_search: data.model_search || null,
           stream: data.stream || false,
           debug: !!data.debug,
@@ -462,32 +502,48 @@ async function handleBridgePrompt(data) {
           continue; // retry
         }
 
-        sendWs({
+        const responseData = {
           type: "response",
-          id,
-          text: result.text || "",
+          id: id,
+          text: result.text,
           conversation_id: result.conversation_id || null,
           conversation_title: result.conversation_title || null,
           _debug: result._debug || null,
-        });
+        };
+        sendWs(responseData);
+
+        // After a successful response, navigate the tab to the conversation URL
+        // so subsequent turns don't need to navigate (avoiding DOM destruction).
+        if (result.conversation_id && tab.id) {
+          const currentUrl = tab.url || "";
+          if (!currentUrl.includes(`/c/${result.conversation_id}`)) {
+            try {
+              await navigateTabAndWait(tab.id, `https://chatgpt.com/c/${result.conversation_id}`);
+              connectedTabs.delete(tab.id);
+              await sleep(300);
+              await injectContentScript(tab.id, "post-response-nav");
+            } catch (navErr) {
+              logInjection(tab.id, null, "post-response-nav-failed", "background", navErr?.message || String(navErr));
+            }
+          }
+        }
+
         return;
       } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-        // Re-inject just in case the content script left the tab in a broken state.
-        if (attempt === 0) {
-          try { await injectContentScript(tab.id, "retry"); } catch (_) {}
-          await sleep(250);
+        lastError = err;
+        const msg = err?.message || String(err);
+        if (!/empty after 10s|did not generate a response/i.test(msg) || attempt === 1) {
+          throw err;
         }
         // loop will retry; if attempt === 1 lastError will be propagated below.
       }
     }
-    // Both attempts exhausted.
-    throw lastError || new Error("ChatGPT did not generate a response after 2 attempts");
+    throw lastError || new Error("Content script returned no response after 2 attempts");
   } catch (err) {
-    sendWs({ type: "error", id, error: err?.message || String(err) });
+    const errMsg = err?.message || String(err);
+    sendWs({ type: "error", id: id, error: errMsg });
   }
 }
-
 async function handleBridgeReload() {
   await injectOpenChatGptTabs("reload");
   const tabs = await chrome.tabs.query({ url: CHATGPT_URL_PATTERN });
@@ -583,6 +639,10 @@ async function connectWs() {
       });
     } else if (data.type === "reload") {
       handleBridgeReload();
+    } else if (data.type === "new_chat") {
+      handleBridgeNewChat(data).catch((err) => {
+        sendWs({ type: "new_chat_error", id: data.id || null, error: err?.message || String(err) });
+      });
     }
   };
 
@@ -667,7 +727,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === "done") {
-    sendWs({ type: "done", id: message.id });
+    sendWs({ type: "done", id: message.id, conversation_id: message.conversation_id || null, conversation_title: message.conversation_title || null });
     sendResponse({ received: true });
     return false;
   }
