@@ -108,7 +108,7 @@ async def main():
     ss = await raw("Page.captureScreenshot", {"format":"jpeg","quality":85,"fromSurface":True})
     if ss:
         img = base64.b64decode(ss["result"]["data"])
-        with open("/home/david/chatgpt-extension/ui-maps/exploration/canvas_tab_inspect.jpg","wb") as fh: fh.write(img)
+        with open("/path/to/chatgpt-extension/ui-maps/exploration/canvas_tab_inspect.jpg","wb") as fh: fh.write(img)
         print(f"\nScreenshot: {len(img)} bytes")
 
 asyncio.run(main())

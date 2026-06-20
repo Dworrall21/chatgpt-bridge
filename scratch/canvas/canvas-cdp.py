@@ -76,7 +76,7 @@ async def main():
     # Screenshot
     ss = await raw("Page.captureScreenshot", {"format": "jpeg", "quality": 90, "fromSurface": True})
     img = base64.b64decode(ss["result"]["data"])
-    path = "/home/david/chatgpt-extension/ui-maps/exploration/canvas_cdp_state.jpg"
+    path = "/path/to/chatgpt-extension/ui-maps/exploration/canvas_cdp_state.jpg"
     with open(path, "wb") as fh: fh.write(img)
     print(f"Screenshot: {len(img)} bytes")
 

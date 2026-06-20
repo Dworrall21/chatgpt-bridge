@@ -6,8 +6,8 @@ clicks unexplored ones, and recurses. Builds a comprehensive UI plan map.
 """
 import json, asyncio, urllib.request, websockets, base64, time, os, sys
 
-MAPPED_FILE = "/home/david/chatgpt-extension/ui-maps/explored_tools.txt"
-SCREENSHOT_DIR = "/home/david/chatgpt-extension/ui-maps/exploration"
+MAPPED_FILE = "/path/to/chatgpt-extension/ui-maps/explored_tools.txt"
+SCREENSHOT_DIR = "/path/to/chatgpt-extension/ui-maps/exploration"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 # Track tools we've already explored to avoid loops

@@ -63,7 +63,7 @@ async def main():
     ss = await raw("Page.captureScreenshot", {"format": "jpeg", "quality": 90, "fromSurface": True})
     img = base64.b64decode(ss["result"]["data"])
     ts = time.strftime("%H%M%S")
-    path = f"/home/david/chatgpt-extension/ui-maps/exploration/plus_fresh_{ts}.jpg"
+    path = f"/path/to/chatgpt-extension/ui-maps/exploration/plus_fresh_{ts}.jpg"
     with open(path, "wb") as fh: fh.write(img)
     print(f"Screenshot: {len(img)} bytes -> {path}")
     
@@ -100,7 +100,7 @@ async def main():
             resp = await js("(()=>{var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');if(!a.length)return '';return a[a.length-1].textContent||''})()")
             if resp:
                 print(f"\n=== Plus Menu ({len(resp)} chars) ===\n{resp}")
-                with open(f"/home/david/chatgpt-extension/ui-maps/exploration/plus_fresh_{ts}.txt", "w") as fh: fh.write(resp)
+                with open(f"/path/to/chatgpt-extension/ui-maps/exploration/plus_fresh_{ts}.txt", "w") as fh: fh.write(resp)
             break
 
 asyncio.run(main())

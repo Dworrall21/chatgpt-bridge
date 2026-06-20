@@ -2,7 +2,7 @@
 """Open More submenu by properly hovering first, then clicking."""
 import json, asyncio, urllib.request, websockets, base64, time, os
 
-SCREENSHOT_DIR = "/home/david/chatgpt-extension/ui-maps/exploration"
+SCREENSHOT_DIR = "/path/to/chatgpt-extension/ui-maps/exploration"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 async def main():

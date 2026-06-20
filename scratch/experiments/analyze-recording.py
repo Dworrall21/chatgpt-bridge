@@ -2,8 +2,8 @@
 """Send key recording frames to ChatGPT for analysis."""
 import json, asyncio, urllib.request, websockets, base64, time, os
 
-REC_DIR = "/home/david/chatgpt-extension/recordings/canvas-edit-1779937902"
-SCREENSHOT_DIR = "/home/david/chatgpt-extension/ui-maps/exploration"
+REC_DIR = "/path/to/chatgpt-extension/recordings/canvas-edit-1779937902"
+SCREENSHOT_DIR = "/path/to/chatgpt-extension/ui-maps/exploration"
 
 # Select key frames representing state changes
 KEY_FRAMES = [0, 1, 12, 30, 33, 36, 46, 52, 57]

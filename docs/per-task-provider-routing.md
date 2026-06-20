@@ -299,7 +299,7 @@ All existing callers are unaffected:
 
 1. Run the existing test suite:
    ```bash
-   cd /home/david/.hermes/hermes-agent
+   cd /path/to/hermes-agent
    python3 -m pytest tests/test_delegate_task.py -v
    ```
 

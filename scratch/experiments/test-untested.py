@@ -2,7 +2,7 @@
 """Batch test all untested plus menu features."""
 import json, asyncio, urllib.request, websockets, base64, time, os, re
 
-SCREENSHOT_DIR = "/home/david/chatgpt-extension/ui-maps/exploration/testing"
+SCREENSHOT_DIR = "/path/to/chatgpt-extension/ui-maps/exploration/testing"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 async def test_feature(tab, feature_name, click_x, click_y, needs_submenu=False, submenu_click=None):

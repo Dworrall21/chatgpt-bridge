@@ -2,7 +2,7 @@
 """Explore all 6 items in the 'More' submenu one by one."""
 import json, asyncio, urllib.request, websockets, base64, time, os, re
 
-SCREENSHOT_DIR = "/home/david/chatgpt-extension/ui-maps/exploration"
+SCREENSHOT_DIR = "/path/to/chatgpt-extension/ui-maps/exploration"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 MORE_ITEMS = [

@@ -2,7 +2,7 @@
 """Systematic vision-guided exploration of every option in the plus menu."""
 import json, asyncio, urllib.request, websockets, base64, time, os, re
 
-SCREENSHOT_DIR = "/home/david/chatgpt-extension/ui-maps/exploration"
+SCREENSHOT_DIR = "/path/to/chatgpt-extension/ui-maps/exploration"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 # The items we know are in the plus menu

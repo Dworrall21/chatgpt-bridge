@@ -60,7 +60,7 @@ async def main():
     
     ss1 = await raw("Page.captureScreenshot", {"format":"jpeg","quality":90,"fromSurface":True})
     img1 = base64.b64decode(ss1["result"]["data"])
-    with open("/home/david/chatgpt-extension/ui-maps/exploration/canvas_activated.jpg","wb") as fh: fh.write(img1)
+    with open("/path/to/chatgpt-extension/ui-maps/exploration/canvas_activated.jpg","wb") as fh: fh.write(img1)
     print(f"Canvas activated screenshot: {len(img1)} bytes")
     
     # Type canvas prompt
@@ -77,7 +77,7 @@ Include all 14 plus menu features, the sidebar navigation, and composer tools.""
     
     ss2 = await raw("Page.captureScreenshot", {"format":"jpeg","quality":90,"fromSurface":True})
     img2 = base64.b64decode(ss2["result"]["data"])
-    with open("/home/david/chatgpt-extension/ui-maps/exploration/canvas_prompt_typed.jpg","wb") as fh: fh.write(img2)
+    with open("/path/to/chatgpt-extension/ui-maps/exploration/canvas_prompt_typed.jpg","wb") as fh: fh.write(img2)
     
     # Send via Enter
     print("Sending via Enter...")
@@ -114,13 +114,13 @@ Include all 14 plus menu features, the sidebar navigation, and composer tools.""
             resp = await js("(()=>{var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');if(!a.length)return '';return a[a.length-1].textContent||''})()")
             if resp:
                 print(f"\n=== Canvas Response ({len(resp)} chars) ===\n{resp[:300]}...")
-                with open("/home/david/chatgpt-extension/ui-maps/exploration/canvas_response.txt","w") as fh: fh.write(resp)
+                with open("/path/to/chatgpt-extension/ui-maps/exploration/canvas_response.txt","w") as fh: fh.write(resp)
                 break
         
         if i == 25:
             await raw("Page.captureScreenshot", {"format":"jpeg","quality":90,"fromSurface":True})
             ss3 = await raw("Page.captureScreenshot", {"format":"jpeg","quality":90,"fromSurface":True})
             img3 = base64.b64decode(ss3["result"]["data"])
-            with open("/home/david/chatgpt-extension/ui-maps/exploration/canvas_timeout.jpg","wb") as fh: fh.write(img3)
+            with open("/path/to/chatgpt-extension/ui-maps/exploration/canvas_timeout.jpg","wb") as fh: fh.write(img3)
 
 asyncio.run(main())
