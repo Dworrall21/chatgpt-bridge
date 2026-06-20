@@ -2,7 +2,7 @@
 """CDP flight recorder — captures events for user interactions."""
 import json, asyncio, urllib.request, websockets, time, os, signal
 
-RECORDING_DIR = f"/home/david/chatgpt-extension/recordings/canvas-edit-{int(time.time())}"
+RECORDING_DIR = f"/path/to/chatgpt-extension/recordings/canvas-edit-{int(time.time())}"
 os.makedirs(RECORDING_DIR, exist_ok=True)
 
 async def main():

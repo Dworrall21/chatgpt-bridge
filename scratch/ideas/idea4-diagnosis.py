@@ -56,7 +56,7 @@ async def main():
     # Take screenshot of the "failed" state
     ss = await raw("Page.captureScreenshot", {"format": "jpeg", "quality": 90, "fromSurface": True})
     img = base64.b64decode(ss["result"]["data"])
-    fail_path = "/home/david/chatgpt-extension/vision-clicks/failure_state.jpg"
+    fail_path = "/path/to/chatgpt-extension/vision-clicks/failure_state.jpg"
     with open(fail_path, "wb") as fh: fh.write(img)
     print(f"Screenshot saved: {fail_path}")
     

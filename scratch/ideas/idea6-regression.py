@@ -34,7 +34,7 @@ async def main():
     await raw("Input.enable")
     await raw("Emulation.setDeviceMetricsOverride", {"width": 1280, "height": 891, "deviceScaleFactor": 1, "mobile": False})
     
-    reg_dir = "/home/david/chatgpt-extension/ui-maps/regression"
+    reg_dir = "/path/to/chatgpt-extension/ui-maps/regression"
     os.makedirs(reg_dir, exist_ok=True)
     
     print("=== Idea 6: Regression Testing (single-image) ===\n")

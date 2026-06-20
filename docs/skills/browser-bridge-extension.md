@@ -532,7 +532,7 @@ from the command line at launch:
 google-chrome-stable \
   --remote-debugging-port=9222 \
   --user-data-dir=/tmp/chrome-debug \
-  --load-extension=/home/david/chatgpt-extension \
+  --load-extension=/path/to/chatgpt-extension \
   --no-first-run \
   "https://target-app.com"
 ```

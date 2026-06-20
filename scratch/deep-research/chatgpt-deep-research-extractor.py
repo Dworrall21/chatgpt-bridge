@@ -163,7 +163,7 @@ async def main():
     args = parser.parse_args()
 
     target_url = args.url
-    out_dir = Path(args.out or f"/home/david/chatgpt-extension/research-extractions/{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    out_dir = Path(args.out or f"/path/to/chatgpt-extension/research-extractions/{datetime.now().strftime('%Y%m%d-%H%M%S')}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     results = {"network": None, "dom": None, "iframe": None, "screenshots": []}

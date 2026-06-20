@@ -374,7 +374,7 @@ echo "Conversation ID: $CID"
 cronjob action=create \\
   name="Deep Research Monitor" \\
   schedule="every 5m" \\
-  prompt="cd /home/david/chatgpt-extension && python3 -u deep-research-monitor.py monitor $CID"
+  prompt="cd /path/to/chatgpt-extension && python3 -u deep-research-monitor.py monitor $CID"
 ```
 
 ### Monitor output format

@@ -68,7 +68,7 @@ async def main():
     # Take screenshot
     ss = await raw("Page.captureScreenshot", {"format": "jpeg", "quality": 90, "fromSurface": True})
     img = base64.b64decode(ss["result"]["data"])
-    path = "/home/david/chatgpt-extension/ui-maps/exploration/agent_mode_active.jpg"
+    path = "/path/to/chatgpt-extension/ui-maps/exploration/agent_mode_active.jpg"
     with open(path, "wb") as fh: fh.write(img)
     print(f"Screenshot: {len(img)} bytes")
     
@@ -94,7 +94,7 @@ Provide your analysis of what Agent mode can do."""
     
     ss2 = await raw("Page.captureScreenshot", {"format": "jpeg", "quality": 90, "fromSurface": True})
     img2 = base64.b64decode(ss2["result"]["data"])
-    path2 = "/home/david/chatgpt-extension/ui-maps/exploration/agent_mode_prompt.jpg"
+    path2 = "/path/to/chatgpt-extension/ui-maps/exploration/agent_mode_prompt.jpg"
     with open(path2, "wb") as fh: fh.write(img2)
     print(f"Prompt screenshot: {len(img2)} bytes")
     
@@ -131,14 +131,14 @@ Provide your analysis of what Agent mode can do."""
                 # Extract only the last assistant response (not our prompt)
                 last_resp = resp
                 print(f"\n=== Agent Response ({len(last_resp)} chars) ===\n{last_resp[:500]}...")
-                with open("/home/david/chatgpt-extension/ui-maps/exploration/agent_mode_response.txt", "w") as fh:
+                with open("/path/to/chatgpt-extension/ui-maps/exploration/agent_mode_response.txt", "w") as fh:
                     fh.write(last_resp)
             break
         
         if i == 18:  # 90s timeout
             ss3 = await raw("Page.captureScreenshot", {"format": "jpeg", "quality": 90, "fromSurface": True})
             img3 = base64.b64decode(ss3["result"]["data"])
-            with open("/home/david/chatgpt-extension/ui-maps/exploration/agent_mode_timeout.jpg", "wb") as fh: fh.write(img3)
+            with open("/path/to/chatgpt-extension/ui-maps/exploration/agent_mode_timeout.jpg", "wb") as fh: fh.write(img3)
             print("  TIMEOUT - screenshot saved")
 
 asyncio.run(main())

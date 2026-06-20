@@ -2,7 +2,7 @@
 """Explore the 'More' submenu in the plus button menu — using vision to find exact chevron position."""
 import json, asyncio, urllib.request, websockets, base64, time, os, re
 
-SCREENSHOT_DIR = "/home/david/chatgpt-extension/ui-maps/exploration"
+SCREENSHOT_DIR = "/path/to/chatgpt-extension/ui-maps/exploration"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 async def main():

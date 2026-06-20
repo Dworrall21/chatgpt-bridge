@@ -3,7 +3,7 @@
 import json, asyncio, urllib.request, websockets, base64, time, sys, os
 
 ANALYSIS_PROMPT = "Describe EVERY visible element on this ChatGPT page. For each: type, text/label, position, purpose. Be exhaustive."
-SAVE_DIR = "/home/david/chatgpt-extension/ui-maps"
+SAVE_DIR = "/path/to/chatgpt-extension/ui-maps"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 async def main():

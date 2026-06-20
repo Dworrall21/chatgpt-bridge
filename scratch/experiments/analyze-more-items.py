@@ -2,7 +2,7 @@
 """Analyze all 5 More submenu item screenshots via vision."""
 import json, asyncio, urllib.request, websockets, base64, time, os
 
-SCREENSHOT_DIR = "/home/david/chatgpt-extension/ui-maps/exploration"
+SCREENSHOT_DIR = "/path/to/chatgpt-extension/ui-maps/exploration"
 
 items_to_analyze = [
     ("Add sources", "add_sources_clicked_direct.jpg"),

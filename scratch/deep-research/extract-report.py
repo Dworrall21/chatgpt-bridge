@@ -3,7 +3,7 @@
 import json, asyncio, urllib.request, websockets, base64, sys, time
 
 CID = "6a1729b2-3480-83e8-b41d-390aed8b8cf8"
-OUT = f"/home/david/chatgpt-extension/research-sessions/{CID}/report.md"
+OUT = f"/path/to/chatgpt-extension/research-sessions/{CID}/report.md"
 
 async def main():
     msg_id = [0]

@@ -40,7 +40,7 @@ async def main():
         ("model_picker", base_url, "open model picker"),
     ]
     
-    ui_map_dir = "/home/david/chatgpt-extension/ui-maps"
+    ui_map_dir = "/path/to/chatgpt-extension/ui-maps"
     os.makedirs(ui_map_dir, exist_ok=True)
     
     print("=== Idea 5: Structural UI Audit ===\n")

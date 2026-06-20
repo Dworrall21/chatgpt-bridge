@@ -52,7 +52,7 @@ async def main():
     ss = await raw("Page.captureScreenshot", {"format": "jpeg", "quality": 95, "fromSurface": True, "captureBeyondViewport": True})
     img = base64.b64decode(ss["result"]["data"])
     print(f"Screenshot: {len(img)} bytes")
-    tall_path = "/home/david/chatgpt-extension/vision-clicks/tall_report.jpg"
+    tall_path = "/path/to/chatgpt-extension/vision-clicks/tall_report.jpg"
     with open(tall_path, "wb") as fh: fh.write(img)
     
     # Now send to fresh temp chat for extraction
@@ -112,7 +112,7 @@ async def main():
                 print(resp[:500] + "...")
                 print(f"\n...end: {resp[-200:]}")
                 
-                save_path = "/home/david/chatgpt-extension/vision-clicks/extracted-text.txt"
+                save_path = "/path/to/chatgpt-extension/vision-clicks/extracted-text.txt"
                 with open(save_path, "w") as fh: fh.write(resp)
                 print(f"\nSaved to {save_path}")
             break

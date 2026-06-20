@@ -5,9 +5,9 @@ This test verifies that delegate_task correctly routes sub-agents to
 different providers based on per-task provider/model overrides.
 
 Usage:
-  cd /home/david/.hermes/hermes-agent
+  cd /path/to/hermes-agent
   source venv/bin/activate
-  python3 /home/david/chatgpt-extension/test-per-task-routing.py
+  python3 /path/to/chatgpt-extension/test-per-task-routing.py
 
 Requires:
   - Hermes venv with all dependencies

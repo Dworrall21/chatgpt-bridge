@@ -156,7 +156,6 @@ def format_uptime(seconds):
 
 
 _MODEL_CATALOG_CANDIDATES = [
-    Path("/home/david/.hermes/cache/model_catalog.json"),
     Path.home() / ".hermes" / "cache" / "model_catalog.json",
     Path.home() / ".hermes" / "chatgpt_bridge_state" / "model_catalog.json",
     Path.home() / ".hermes" / "chatgpt_bridge_state" / "models.json",
