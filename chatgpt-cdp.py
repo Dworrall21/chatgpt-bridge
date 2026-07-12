@@ -79,7 +79,8 @@ JSON.stringify((() => {{
 
   const last = assistants[assistants.length - 1];
   const turn =
-    last.closest('[data-testid^="conversation-turn-"], article') ||
+    last.closest('[data-testid^="conversation-turn-"]') ||
+    last.closest('article') ||
     last.parentElement ||
     last;
   const content = last.querySelector('.markdown, .prose') || last;
