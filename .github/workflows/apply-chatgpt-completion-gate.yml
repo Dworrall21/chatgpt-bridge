@@ -1,0 +1,42 @@
+name: Apply ChatGPT completion gate
+
+on:
+  push:
+    branches:
+      - agent/session-aware-chatgpt-cdp
+    paths:
+      - .github/workflows/apply-chatgpt-completion-gate.yml
+      - .github/scripts/apply_completion_gate.py
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Apply completion gate
+        run: python3 .github/scripts/apply_completion_gate.py
+
+      - name: Validate
+        run: |
+          python3 -m py_compile chatgpt-cdp.py
+          pytest -q tests/test_chatgpt_cdp.py
+
+      - name: Commit generated changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add chatgpt-cdp.py tests/test_chatgpt_cdp.py
+          if git diff --cached --quiet; then
+            echo "No generated changes"
+            exit 0
+          fi
+          git commit -m "Require ChatGPT action bar before aggregation"
+          git push origin HEAD:${{ github.ref_name }}
