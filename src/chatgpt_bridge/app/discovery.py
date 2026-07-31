@@ -77,11 +77,8 @@ _JS_APP_IDENTITY = """
 
 _JS_MODEL_MENU = """
 () => {
-  const btn = document.querySelector('[aria-label="Select ChatGPT model"]');
-  if (!btn) return { found: false };
-  btn.click();
   const items = [];
-  for (const m of document.querySelectorAll('[role=menuitem]')) {
+  for (const m of document.querySelectorAll('[role=menuitem][data-orientation="vertical"]')) {
     const t = (m.innerText || '').trim().replace(/\\n/g, '|');
     if (!t) continue;
     items.push({ text: t, selected: m.getAttribute('data-chatgpt-model-selected'), state: m.getAttribute('data-state') });
@@ -98,6 +95,7 @@ def _capture_project_id(entries: list[dict]) -> list[str]:
         re.compile(r"projects?[/=]([0-9a-fA-F-]{20,})"),
         re.compile(r"p[/=]([0-9a-fA-F-]{20,})"),
         re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"),
+        re.compile(r"(cloud:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"),
     ]
     for e in entries:
         for v in [e.get("href", "")] + list(e.get("attrs", {}).values()):
@@ -133,9 +131,33 @@ def discover(*, cdp_url: str = "http://127.0.0.1:9222", renderer_origin: str = "
         candidate_ids = _capture_project_id(project_entries + sidebar.get("entries", []))
         unique_ids = sorted(set(candidate_ids))
 
-        # Model picker observation (read-only; closes menu afterwards).
+        # Prefer the exact chatgpt-bridge row attribute as the authoritative ID source.
+        pinned_row_id = None
+        for e in sidebar.get("entries", []):
+            pid = (e.get("attrs", {}) or {}).get("data-app-action-sidebar-project-id")
+            label = (e.get("attrs", {}) or {}).get("data-app-action-sidebar-project-label")
+            if label == _PROJECT_NAME and pid:
+                pinned_row_id = pid
+                break
+        if pinned_row_id is None:
+            for e in project_entries:
+                pid = (e.get("attrs", {}) or {}).get("data-app-action-sidebar-project-id")
+                if pid and _PROJECT_NAME in pid:
+                    pinned_row_id = pid
+                    break
+        # Independent source 2: a DIFFERENT DOM element carrying the same pinned id.
+        carriers = []
+        for x in project_entries:
+            attrs = x.get("attrs", {}) or {}
+            if attrs.get("data-app-action-sidebar-project-id") == pinned_row_id or attrs.get("href") == pinned_row_id:
+                carriers.append(x)
+        id_sources = len({id(e) for e in carriers}) if pinned_row_id else 0
+
+        # Model picker observation (read-only; trusted CDP click, closes menu afterwards).
         model = None
         try:
+            pg.locator('[aria-label="Select ChatGPT model"]').click(force=True)
+            pg.wait_for_timeout(700)
             model = pg.evaluate(_JS_MODEL_MENU)
             pg.keyboard.press("Escape")
             pg.wait_for_timeout(200)
@@ -153,10 +175,11 @@ def discover(*, cdp_url: str = "http://127.0.0.1:9222", renderer_origin: str = "
                 "direct_matches": len(project_entries),
                 "sidebar": sidebar,
                 "project_name": _PROJECT_NAME,
+                "pinned_project_id": pinned_row_id,
                 "candidate_ids": unique_ids,
-                "id_sources": len(unique_ids),
-                "enrollment_ready": len(unique_ids) >= 1,
-                "note": "opaque ID must be confirmed from >=2 independent sources before Phase 2",
+                "id_sources": id_sources,
+                "enrollment_ready": id_sources >= 2,
+                "note": "opaque ID must be confirmed from >=2 independent DOM sources before Phase 2",
             },
             "model_picker": model,
             "account_fingerprint": account_fingerprint,
