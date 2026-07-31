@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:chatgpt-bridge:request:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "request_id", "idempotency_key", "created_at", "deadline_at", "hermes", "target_assertions", "conversation", "task"],
+  "properties": {
+    "protocol_version": {"const": "1.0"},
+    "request_id": {"type": "string", "format": "uuid"},
+    "idempotency_key": {"type": "string", "minLength": 16, "maxLength": 128},
+    "created_at": {"type": "string", "format": "date-time"},
+    "deadline_at": {"type": "string", "format": "date-time"},
+    "hermes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "task_id", "route"],
+      "properties": {
+        "session_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "parent_agent_id": {"type": "string", "maxLength": 256},
+        "route": {"const": "delegate_task"}
+      }
+    },
+    "target_assertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_name", "mode", "model_label", "effort_label"],
+      "properties": {
+        "project_name": {"const": "chatgpt-bridge"},
+        "project_id": {"type": ["string", "null"], "maxLength": 256},
+        "mode": {"const": "Work"},
+        "model_label": {"const": "GPT-5.6 Sol"},
+        "effort_label": {"const": "High"}
+      }
+    },
+    "conversation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy"],
+      "properties": {
+        "policy": {"enum": ["reuse_session", "new_shard"]},
+        "isolation_key": {"type": ["string", "null"], "maxLength": 128},
+        "max_turns": {"type": "integer", "minimum": 1, "maximum": 50, "default": 24},
+        "max_estimated_context_tokens": {"type": "integer", "minimum": 1000, "maximum": 120000, "default": 70000}
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "instruction", "context", "constraints", "output_contract"],
+      "properties": {
+        "kind": {"enum": ["planning", "review", "design"]},
+        "instruction": {"type": "string", "minLength": 1, "maxLength": 100000},
+        "context": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["label", "content", "sha256"],
+            "properties": {
+              "label": {"type": "string", "minLength": 1, "maxLength": 128},
+              "content": {"type": "string", "maxLength": 100000},
+              "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+            }
+          }
+        },
+        "constraints": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"type": "string", "maxLength": 2000}
+        },
+        "output_contract": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["format", "max_characters"],
+          "properties": {
+            "format": {"enum": ["text", "markdown", "json"]},
+            "max_characters": {"type": "integer", "minimum": 256, "maximum": 100000},
+            "required_sections": {
+              "type": "array",
+              "maxItems": 32,
+              "items": {"type": "string", "maxLength": 128}
+            }
+          }
+        }
+      }
+    },
+    "accounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "router_input_tokens": {"type": "integer", "minimum": 0},
+        "estimated_native_input_tokens": {"type": "integer", "minimum": 0},
+        "baseline_sample_requested": {"type": "boolean", "default": false}
+      }
+    }
+  }
+}

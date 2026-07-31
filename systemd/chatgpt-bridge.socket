@@ -1,0 +1,10 @@
+[Unit]
+Description=ChatGPT bridge unix socket
+
+[Socket]
+ListenStream=%t/chatgpt-bridge/bridge.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

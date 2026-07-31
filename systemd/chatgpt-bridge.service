@@ -1,0 +1,18 @@
+[Unit]
+Description=ChatGPT Desktop delegation bridge (Hermes -> chatgpt-bridge project)
+After=network.target
+
+[Service]
+Type=simple
+# Phase 0: all capabilities off.
+Environment=CHATGPT_BRIDGE_ENABLED=0
+Environment=CHATGPT_BRIDGE_ALLOW_SEND=0
+Environment=CHATGPT_BRIDGE_AUTOROUTE=0
+Environment=CHATGPT_BRIDGE_HMAC_SECRET=
+ExecStart=/usr/bin/python3 /home/david/Projects/chatgpt-bridge/scripts/chatgpt-bridge.py daemon --config /home/david/Projects/chatgpt-bridge/config/bridge.example.toml --db %h/.local/state/chatgpt-bridge/registry.sqlite3 --metrics-jsonl %h/.local/state/chatgpt-bridge/metrics.jsonl
+Restart=on-failure
+RuntimeDirectory=chatgpt-bridge
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=default.target

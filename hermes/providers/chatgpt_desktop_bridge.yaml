@@ -1,0 +1,12 @@
+# Hermes provider definition for the desktop bridge (Phase 0: DISABLED).
+# Enable in Phase 3+ by pointing delegate_task at this provider.
+providers:
+  chatgpt_desktop_bridge:
+    name: ChatGPT Desktop Bridge
+    type: chatgpt-bridge
+    transport: unix-socket
+    socket_path: /run/user/%U/chatgpt-bridge/bridge.sock
+    default_model: gpt-5.6-sol
+    default_effort: high
+    project: chatgpt-bridge
+    enabled: false

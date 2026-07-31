@@ -1,0 +1,30 @@
+# Narrow auto-routing policy (Phase 5+; DISABLED by default).
+# Delegate ONLY planning/review/design with sufficient expected cost.
+delegate_when:
+  task_kinds: [planning, review, design]
+  requires_tools: false
+  min_expected_native_tokens: 1500
+  context_max_chars: 120000
+
+retain_in_hermes:
+  - shell_execution
+  - filesystem_mutation
+  - git_mutation
+  - credential_access
+  - interactive_debugging
+  - short_answer
+  - synthesis
+  - drafting
+
+limits:
+  max_parallel_bridge_tasks: 1
+  max_prompt_chars: 120000
+  max_response_chars: 60000
+  default_timeout_seconds: 600
+
+fallback:
+  on_bridge_unavailable: local_provider
+  on_model_unavailable: fail_closed
+  on_incomplete_response: retry_once_new_chat
+
+enabled: false

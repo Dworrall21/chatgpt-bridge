@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+registry.sqlite3*
+config/bridge.toml
+config/selectors/*.yaml
+!config/selectors/README.md
+*.metrics.jsonl

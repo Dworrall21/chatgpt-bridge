@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:chatgpt-bridge:response:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "request_id", "idempotency_key", "status", "retryable", "timestamps", "binding", "execution", "usage"],
+  "properties": {
+    "protocol_version": {"const": "1.0"},
+    "request_id": {"type": "string", "format": "uuid"},
+    "idempotency_key": {"type": "string"},
+    "status": {"enum": ["accepted", "queued", "running", "completed", "failed", "cancelled", "needs_reconciliation"]},
+    "retryable": {"type": "boolean"},
+    "attempt": {"type": "integer", "minimum": 0},
+    "timestamps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["received_at", "updated_at"],
+      "properties": {
+        "received_at": {"type": "string", "format": "date-time"},
+        "updated_at": {"type": "string", "format": "date-time"},
+        "sent_at": {"type": ["string", "null"], "format": "date-time"},
+        "completed_at": {"type": ["string", "null"], "format": "date-time"}
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_verified"],
+      "properties": {
+        "account_fingerprint": {"type": ["string", "null"]},
+        "project_name": {"type": ["string", "null"]},
+        "project_id": {"type": ["string", "null"]},
+        "project_verified": {"type": "boolean"},
+        "conversation_id": {"type": ["string", "null"]},
+        "user_message_id": {"type": ["string", "null"]},
+        "assistant_message_id": {"type": ["string", "null"]},
+        "verification_method": {"type": ["string", "null"]}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {"type": ["string", "null"]},
+        "model_label": {"type": ["string", "null"]},
+        "model_backend_id": {"type": ["string", "null"]},
+        "effort_label": {"type": ["string", "null"]},
+        "app_build": {"type": ["string", "null"]},
+        "selector_profile": {"type": ["string", "null"]}
+      }
+    },
+    "result": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "mime_type": {"enum": ["text/plain", "text/markdown", "application/json"]},
+        "text": {"type": "string"},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "truncated": {"type": "boolean"},
+        "full_response_retained": {"type": "boolean"}
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "delegation_request_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "delegation_result_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "actual_hermes_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "baseline_hermes_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "net_hermes_tokens_saved": {"type": ["integer", "null"]},
+        "savings_percent": {"type": ["number", "null"]},
+        "baseline_method": {"enum": ["shadow", "matched_history", "predictive", "unavailable"]},
+        "measurement_confidence": {"enum": ["high", "medium", "low", "unavailable"]}
+      }
+    },
+    "error": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {"type": "string"},
+        "stage": {"type": "string"},
+        "message": {"type": "string"},
+        "safe_to_retry": {"type": "boolean"},
+        "details_hash": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

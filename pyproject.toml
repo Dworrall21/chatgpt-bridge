@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chatgpt-bridge"
+version = "0.1.0"
+description = "Local bridge delegating planning/review/design reasoning from Hermes to the ChatGPT desktop app (GPT-5.6 Sol @ High), confined to the chatgpt-bridge project."
+requires-python = ">=3.12"
+dependencies = [
+    "jsonschema>=4.20",
+]
+
+[project.optional-dependencies]
+cdp = ["playwright>=1.40"]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["chatgpt_bridge", "chatgpt_bridge.protocol", "chatgpt_bridge.hermes", "chatgpt_bridge.app", "chatgpt_bridge.security", "chatgpt_bridge.metrics"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: requires running ChatGPT desktop app (CDP 9222)",
+]
