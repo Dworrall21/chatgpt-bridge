@@ -86,8 +86,24 @@ def main() -> int:
     enr.add_argument("--renderer-origin", default="http://127.0.0.1:5175")
     enr.set_defaults(func=cmd_enroll)
 
+    can = sub.add_parser("canary", help="Phase 2: create ONE HB-CANARY conversation in chatgpt-bridge (user-approved)")
+    can.add_argument("--db", default=os.path.expanduser("~/.local/state/chatgpt-bridge/registry.sqlite3"))
+    can.add_argument("--cdp-url", default="http://127.0.0.1:9222")
+    can.add_argument("--no-send", action="store_true", help="create + verify only, do not send the synthetic prompt")
+    can.set_defaults(func=cmd_canary)
+
     args = parser.parse_args()
     return args.func(args)
+
+
+def cmd_canary(args: argparse.Namespace) -> int:
+    from chatgpt_bridge.app.canary import run_canary
+
+    result = run_canary(cdp_url=args.cdp_url, registry_db=args.db, send=not args.no_send)
+    import json
+
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("ok") else 1
 
 
 if __name__ == "__main__":

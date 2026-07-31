@@ -15,8 +15,13 @@ GPT-5.6 Sol @ High, 2026-07-31).
   packer/reducer/accounting/provider client. All capabilities OFF by default.
 - **Phase 1 (implemented, read-only)**: CDP discovery — app identity, project-list
   observation, model-picker observation. No conversation creation, no sends.
-- Phases 2-6: not yet implemented (canary creation, manual delegation, session reuse,
-  auto-routing, default offload).
+- **Phase 2 (implemented, CANARY VERIFIED live 2026-07-31)**: project-scoped
+  conversation creation via `Start new chat in chatgpt-bridge` primitive, Work-mode
+  model/effort enforcement (5.6 Sol + High via Model/Effort submenus), synthetic
+  canary send + CANARY-OK response, thread-placement proof, binding enrolled
+  (`cloud:Dworrall21/chatgpt-bridge`, 2 sources). Command: `chatgpt-bridge.py canary`.
+- Phases 3-6: not yet implemented (manual delegation, session reuse, auto-routing,
+  default offload).
 
 ## Layout
 
