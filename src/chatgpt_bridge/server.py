@@ -316,6 +316,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         from .hermes.prompt_builder import build_prompt
 
         self.state.registry.set_prompt_text(request_id, build_prompt(payload))
+        self.state.registry.set_policy(request_id, payload["conversation"].get("policy", "reuse_session"))
         self.state.registry.set_request_state(request_id, RequestState.VALIDATED)
         self.state.queue.enqueue(request_id, session_key)
         self.state.metrics.incr("delegations_created")

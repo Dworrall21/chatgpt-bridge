@@ -99,6 +99,7 @@ CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_ke
 _ALTERS = [
     "ALTER TABLE requests ADD COLUMN prompt_text TEXT",
     "ALTER TABLE requests ADD COLUMN result_text TEXT",
+    "ALTER TABLE requests ADD COLUMN policy TEXT",
 ]
 
 
@@ -296,6 +297,28 @@ class Registry:
         with self._lock:
             self._conn.execute(
                 "UPDATE requests SET prompt_text=? WHERE request_id=?", (prompt_text, request_id)
+            )
+            self._conn.commit()
+
+    def set_policy(self, request_id: str, policy: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE requests SET policy=? WHERE request_id=?", (policy, request_id)
+            )
+            self._conn.commit()
+
+    def set_request_conversation(self, request_id: str, conversation_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE requests SET conversation_id=? WHERE request_id=?", (conversation_id, request_id)
+            )
+            self._conn.commit()
+
+    def set_conversation_href(self, conversation_id: str, href: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE conversations SET conversation_href=? WHERE conversation_id=?",
+                (href, conversation_id),
             )
             self._conn.commit()
 

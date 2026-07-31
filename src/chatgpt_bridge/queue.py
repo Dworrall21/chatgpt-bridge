@@ -100,7 +100,8 @@ class JobQueue:
         raise RuntimeError("allow_send=true but no CDP executor installed (Phase 2+)")
 
     def _cdp_executor(self, job: Job, registry: Registry, flags: Flags) -> None:
-        """Phase 3 executor: real CDP send through the canary-verified path."""
+        """Phase 4 executor: real CDP send through the canary-verified path,
+        with per-session conversation reuse + sharding thresholds."""
         from .app.driver import DesktopDriver
         from .config import Config
 
@@ -114,11 +115,24 @@ class JobQueue:
             raise RuntimeError("prompt_text missing from journal")
 
         registry.set_request_state(job.request_id, RequestState.PROJECT_VERIFIED)
+
+        # conversation selection: reuse when eligible, else create (new shard)
         conv = registry.get_active_conversation(job.session_key)
+        policy = row.get("policy") or "reuse_session"
+        if policy == "new_shard":
+            conv = None
+        if conv is not None and self._eligible(conv, cfg):
+            if conv.get("conversation_href"):
+                driver.open_conversation(conv["conversation_href"])
+            else:
+                conv = None  # no app thread handle; create fresh
+        else:
+            conv = None
         if conv is None:
             conv = driver.create_conversation(
                 job.session_key, title=f"HB {job.session_key[:8]} · S1 · {row.get('task_id', 'task')[:40]}"
             )
+        registry.set_request_conversation(row["request_id"], conv["conversation_id"])
         registry.set_request_state(job.request_id, RequestState.CONVERSATION_BOUND)
         registry.set_request_state(job.request_id, RequestState.MODEL_VERIFIED)
         registry.set_request_state(job.request_id, RequestState.SEND_INTENT_RECORDED)
@@ -135,8 +149,48 @@ class JobQueue:
             result_text,
             response_hash=hashlib.sha256(result_text.encode("utf-8")).hexdigest(),
         )
+        # capture the app thread id now that the thread row exists post-send
+        href = driver.capture_active_thread_id()
+        if href and conv.get("conversation_href") != href:
+            registry.set_conversation_href(conv["conversation_id"], href)
+            conv["conversation_href"] = href
         registry.set_request_state(job.request_id, RequestState.COMPLETED)
-        registry.bump_conversation(conv["conversation_id"], turn_count=1)
+        registry.bump_conversation(
+            conv["conversation_id"],
+            turn_count=conv.get("turn_count", 0) + 1,
+            estimated_context_tokens=conv.get("estimated_context_tokens", 0) + len(prompt_text) // 4,
+        )
+
+    @staticmethod
+    def _eligible(conv: dict, cfg) -> bool:
+        from .config import ConversationConfig
+
+        cc: ConversationConfig = cfg.conversation
+        now = int(__import__("time").time())
+        if conv.get("status") != "active":
+            return False
+        if conv.get("turn_count", 0) >= cc.max_turns_per_shard:
+            return False
+        if conv.get("estimated_context_tokens", 0) >= cc.max_estimated_context_tokens:
+            return False
+        last = conv.get("last_used_at") or 0
+        if now - last > cc.max_idle_days * 86400:
+            return False
+        return True
+
+    def recover(self) -> None:
+        """Restart recovery: reconcile durable requests without resending."""
+        for row in self.registry.durable_after_send():
+            state = row["request_state"]
+            if state == RequestState.SEND_INTENT_RECORDED.value and not row.get("user_message_id"):
+                # intent recorded, no evidence of an actual send: safe to requeue
+                self.registry.set_request_state(
+                    row["request_id"], RequestState.FAILED, error_code="NEEDS_RECONCILIATION", error_stage="recovery"
+                )
+            else:
+                self.registry.set_request_state(
+                    row["request_id"], RequestState.NEEDS_RECONCILIATION, error_code="PENDING_RECONCILIATION", error_stage="recovery"
+                )
 
     def stats(self) -> QueueStats:
         s = QueueStats()

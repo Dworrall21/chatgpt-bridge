@@ -26,8 +26,13 @@ GPT-5.6 Sol @ High, 2026-07-31).
   the daemon's CDP executor creates a project conversation, enforces Sol/High,
   sends, waits, and stores the bounded result. Verified: accepted→queued→completed,
   project_verified=true, result returned. One task per conversation (no reuse yet).
-- Phases 4-6: not yet implemented (session reuse + reconciliation, auto-routing,
-  default offload).
+- **Phase 4 (implemented, LIVE VERIFIED 2026-07-31)**: per-session conversation
+  reuse — thread id captured post-send, `reuse_session` policy reopens the same
+  project conversation (verified: two requests → same conversation_id, turn_count 2,
+  accumulated context estimate), sharding thresholds (turns 24 / context 70k /
+  idle 7d / quarantine), `--new-shard` override, restart recovery (`recover()`:
+  intent-without-evidence → fail-closed; post-send → NEEDS_RECONCILIATION).
+- Phases 5-6: not yet implemented (auto-routing, default offload).
 
 ## Layout
 

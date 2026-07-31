@@ -48,6 +48,7 @@ def main() -> int:
     ap.add_argument("--output-format", default="markdown", choices=["text", "markdown", "json"])
     ap.add_argument("--max-characters", type=int, default=6000)
     ap.add_argument("--session-id", default=os.environ.get("HERMES_SESSION_ID", "cli"))
+    ap.add_argument("--new-shard", action="store_true", help="force a new project conversation (default: reuse session conversation)")
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--config", default=None)
     ap.add_argument("--dry-run", action="store_true", help="build + submit only, no poll")
@@ -88,7 +89,7 @@ def main() -> int:
             "model_label": "GPT-5.6 Sol",
             "effort_label": "High",
         },
-        "conversation": {"policy": "new_shard"},
+        "conversation": {"policy": "new_shard" if args.new_shard else "reuse_session"},
         "task": {
             "kind": args.kind,
             "instruction": packed.instruction,

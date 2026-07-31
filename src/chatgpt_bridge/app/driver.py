@@ -55,6 +55,13 @@ class DesktopDriver:
             page.wait_for_timeout(2200)
             if _visible_textbox(page) is None:
                 raise ConversationMetadataUnavailableError("composer did not open")
+            thread_id = None
+            for _ in range(4):
+                thread_id = self._active_thread_id(page)
+                if thread_id:
+                    break
+                page.wait_for_timeout(400)
+            # thread row may only appear after the first send; caller updates it.
         now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
         conv = {
             "conversation_id": f"{session_key}-{now}",
@@ -62,7 +69,7 @@ class DesktopDriver:
             "shard_number": 1,
             "project_id": self.project_id,
             "title": title,
-            "conversation_href": None,
+            "conversation_href": thread_id,  # app thread id used for reuse
             "mode": self.config.app.required_mode,
             "model_label": self.config.app.required_model_label,
             "model_backend_id": None,
@@ -77,6 +84,54 @@ class DesktopDriver:
         }
         self.registry.create_conversation(conv)
         return conv
+
+    @staticmethod
+    def _active_thread_id(page: Any) -> str | None:
+        try:
+            return page.evaluate(
+                """() => {
+                  const el = document.querySelector('[data-app-action-sidebar-thread-active="true"]');
+                  return el ? el.getAttribute('data-app-action-sidebar-thread-id') : null;
+                }"""
+            )
+        except Exception:
+            return None
+
+    def capture_active_thread_id(self) -> str | None:
+        with CdpClient(self.config.app.cdp_url) as client:
+            renderer = find_renderer(client, self.config.app.renderer_origin)
+            if renderer is None:
+                return None
+            return self._active_thread_id(renderer.page)
+
+    def open_conversation(self, thread_id: str) -> None:
+        """Navigate to an existing project conversation by its app thread id."""
+        with CdpClient(self.config.app.cdp_url) as client:
+            renderer = find_renderer(client, self.config.app.renderer_origin)
+            if renderer is None:
+                raise ProjectNotFoundError("no renderer found")
+            page = renderer.page
+            row = page.locator(f'[data-app-action-sidebar-thread-id="{thread_id}"]')
+            if row.count() == 0:
+                # sidebar may need the project expanded: open the project first
+                proj = page.locator(f'[data-app-action-sidebar-project-id="{self.project_id}"]')
+                if proj.count():
+                    proj.first.click(force=True)
+                    page.wait_for_timeout(2200)
+                row = page.locator(f'[data-app-action-sidebar-thread-id="{thread_id}"]')
+                if row.count() == 0:
+                    raise ConversationMetadataUnavailableError(f"thread {thread_id} not in sidebar")
+            row.first.click(force=True)
+            page.wait_for_timeout(2200)
+            if _visible_textbox(page) is None:
+                raise ConversationMetadataUnavailableError("composer did not open for existing thread")
+
+    def read_conversation(self, thread_id: str) -> str:
+        """Open a conversation and return its body text (for reconciliation)."""
+        self.open_conversation(thread_id)
+        with CdpClient(self.config.app.cdp_url) as client:
+            renderer = find_renderer(client, self.config.app.renderer_origin)
+            return renderer.page.evaluate("() => document.body.innerText")
 
     # ---- send ------------------------------------------------------------
     def send_and_wait(self, prompt: str, *, timeout_s: int = 900, poll_s: float = 2.0) -> str:
@@ -159,4 +214,8 @@ class DesktopDriver:
                 cut = cut[m.end():]
         # drop leading assistant-turn label if present
         cut = re.sub(r"^ChatGPT said:\s*", "", cut.strip())
+        # terminate at the HERMES-DONE marker (drop trailing timestamps/UI)
+        m = re.search(r"HERMES-DONE", cut)
+        if m:
+            cut = cut[: m.end()]
         return cut.strip()

@@ -20,6 +20,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     registry = Registry(args.db)
     metrics = Metrics(args.metrics_jsonl)
     queue = JobQueue(registry, cfg.flags)
+    queue.recover()
     server = serve(cfg, registry, queue, metrics, sock_path=args.socket)
     print(f"chatgpt-bridge listening on {args.socket or cfg.transport.resolve_socket_path()}", flush=True)
     print(f"flags: enabled={cfg.flags.bridge_enabled} create={cfg.flags.allow_conversation_creation} send={cfg.flags.allow_send} autoroute={cfg.flags.automatic_routing}", flush=True)
