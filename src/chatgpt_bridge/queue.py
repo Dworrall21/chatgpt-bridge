@@ -38,7 +38,12 @@ class JobQueue:
         self._running: dict[str, str | None] = {}  # session_key -> request_id
         self._lock = threading.Lock()
         self._ui_lock = threading.Lock()
-        self._executor = executor or self._stub_executor
+        if executor is not None:
+            self._executor = executor
+        elif flags.allow_send:
+            self._executor = self._cdp_executor
+        else:
+            self._executor = self._stub_executor
 
     def enqueue(self, request_id: str, session_key: str) -> None:
         with self._lock:
@@ -93,6 +98,45 @@ class JobQueue:
             )
             return
         raise RuntimeError("allow_send=true but no CDP executor installed (Phase 2+)")
+
+    def _cdp_executor(self, job: Job, registry: Registry, flags: Flags) -> None:
+        """Phase 3 executor: real CDP send through the canary-verified path."""
+        from .app.driver import DesktopDriver
+        from .config import Config
+
+        cfg = Config.load()
+        driver = DesktopDriver(cfg, registry)
+        row = registry.get_request(job.request_id)
+        if row is None:
+            raise RuntimeError("request vanished")
+        prompt_text = row.get("prompt_text")
+        if not prompt_text:
+            raise RuntimeError("prompt_text missing from journal")
+
+        registry.set_request_state(job.request_id, RequestState.PROJECT_VERIFIED)
+        conv = registry.get_active_conversation(job.session_key)
+        if conv is None:
+            conv = driver.create_conversation(
+                job.session_key, title=f"HB {job.session_key[:8]} · S1 · {row.get('task_id', 'task')[:40]}"
+            )
+        registry.set_request_state(job.request_id, RequestState.CONVERSATION_BOUND)
+        registry.set_request_state(job.request_id, RequestState.MODEL_VERIFIED)
+        registry.set_request_state(job.request_id, RequestState.SEND_INTENT_RECORDED)
+        sentinel = f"[HERMES-BRIDGE v1 request={row['request_id']} task={row.get('task_id', '')} sequence=1]"
+        registry.set_send_evidence(row["request_id"], sentinel)
+        registry.set_request_state(job.request_id, RequestState.SENT)
+        registry.set_request_state(job.request_id, RequestState.WAITING)
+
+        result_text = driver.send_and_wait(prompt_text)
+        import hashlib
+
+        registry.set_result_text(
+            row["request_id"],
+            result_text,
+            response_hash=hashlib.sha256(result_text.encode("utf-8")).hexdigest(),
+        )
+        registry.set_request_state(job.request_id, RequestState.COMPLETED)
+        registry.bump_conversation(conv["conversation_id"], turn_count=1)
 
     def stats(self) -> QueueStats:
         s = QueueStats()

@@ -20,7 +20,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class TransportConfig:
-    socket_path: str = "/run/user/0/chatgpt-bridge/bridge.sock"
+    socket_path: str = "/run/user/%U/chatgpt-bridge/bridge.sock"
     require_peer_uid: bool = True
     require_hmac: bool = True
     hmac_secret_env: str = "CHATGPT_BRIDGE_HMAC_SECRET"

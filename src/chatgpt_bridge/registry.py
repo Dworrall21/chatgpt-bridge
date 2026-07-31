@@ -96,6 +96,11 @@ CREATE INDEX IF NOT EXISTS idx_requests_state ON requests(request_state);
 CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_key);
 """
 
+_ALTERS = [
+    "ALTER TABLE requests ADD COLUMN prompt_text TEXT",
+    "ALTER TABLE requests ADD COLUMN result_text TEXT",
+]
+
 
 class Registry:
     def __init__(self, db_path: str | Path):
@@ -105,6 +110,12 @@ class Registry:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        for alter in _ALTERS:
+            try:
+                self._conn.execute(alter)
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
         self._conn.commit()
         self._lock = __import__("threading").Lock()
 
@@ -278,6 +289,21 @@ class Registry:
             self._conn.execute(
                 "UPDATE requests SET send_sentinel=?, user_message_id=COALESCE(?, user_message_id), assistant_message_id=COALESCE(?, assistant_message_id) WHERE request_id=?",
                 (sentinel, user_message_id, assistant_message_id, request_id),
+            )
+            self._conn.commit()
+
+    def set_prompt_text(self, request_id: str, prompt_text: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE requests SET prompt_text=? WHERE request_id=?", (prompt_text, request_id)
+            )
+            self._conn.commit()
+
+    def set_result_text(self, request_id: str, result_text: str, response_hash: str | None = None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE requests SET result_text=?, response_hash=COALESCE(?, response_hash) WHERE request_id=?",
+                (result_text, response_hash, request_id),
             )
             self._conn.commit()
 

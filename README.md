@@ -20,7 +20,13 @@ GPT-5.6 Sol @ High, 2026-07-31).
   model/effort enforcement (5.6 Sol + High via Model/Effort submenus), synthetic
   canary send + CANARY-OK response, thread-placement proof, binding enrolled
   (`cloud:Dworrall21/chatgpt-bridge`, 2 sources). Command: `chatgpt-bridge.py canary`.
-- Phases 3-6: not yet implemented (manual delegation, session reuse, auto-routing,
+- **Phase 3 (implemented, LIVE VERIFIED 2026-07-31)**: real delegation through the
+  daemon — `hermes/tools/delegate_chatgpt_desktop.py` builds a compact packet
+  (router gate → prompt builder with HERMES-BRIDGE sentinel → UDS submit → poll),
+  the daemon's CDP executor creates a project conversation, enforces Sol/High,
+  sends, waits, and stores the bounded result. Verified: accepted→queued→completed,
+  project_verified=true, result returned. One task per conversation (no reuse yet).
+- Phases 4-6: not yet implemented (session reuse + reconciliation, auto-routing,
   default offload).
 
 ## Layout

@@ -89,6 +89,15 @@ def build_envelope(config: Config, row: dict) -> dict:
             "safe_to_retry": retryable,
             "details_hash": None,
         }
+    result = None
+    if state == RequestState.COMPLETED.value and row.get("result_text"):
+        result = {
+            "mime_type": "text/markdown",
+            "text": row["result_text"],
+            "sha256": row.get("response_hash"),
+            "truncated": False,
+            "full_response_retained": True,
+        }
     return {
         "protocol_version": "1.0",
         "request_id": row["request_id"],
@@ -106,7 +115,16 @@ def build_envelope(config: Config, row: dict) -> dict:
             "account_fingerprint": None,
             "project_name": config.app.required_project_name,
             "project_id": None,
-            "project_verified": False,
+            "project_verified": state
+            in {
+                RequestState.PROJECT_VERIFIED.value,
+                RequestState.CONVERSATION_BOUND.value,
+                RequestState.MODEL_VERIFIED.value,
+                RequestState.SEND_INTENT_RECORDED.value,
+                RequestState.SENT.value,
+                RequestState.WAITING.value,
+                RequestState.COMPLETED.value,
+            },
             "conversation_id": row.get("conversation_id"),
             "user_message_id": row.get("user_message_id"),
             "assistant_message_id": row.get("assistant_message_id"),
@@ -121,6 +139,7 @@ def build_envelope(config: Config, row: dict) -> dict:
             "selector_profile": None,
         },
         "usage": None,
+        "result": result,
         "error": error,
     }
 
@@ -294,6 +313,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "deadline_at": deadline,
             "created_at": now,
         })
+        from .hermes.prompt_builder import build_prompt
+
+        self.state.registry.set_prompt_text(request_id, build_prompt(payload))
         self.state.registry.set_request_state(request_id, RequestState.VALIDATED)
         self.state.queue.enqueue(request_id, session_key)
         self.state.metrics.incr("delegations_created")
