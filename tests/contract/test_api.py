@@ -100,8 +100,12 @@ def test_submit_and_poll(daemon):
     assert code == 202
     assert env["status"] in {"accepted", "queued", "running"}
     # give the stub executor a moment to fail closed (sends disabled)
-    time.sleep(0.6)
-    code2, env2 = client.poll(req["request_id"])
+    env2 = None
+    for _ in range(15):
+        time.sleep(0.4)
+        code2, env2 = client.poll(req["request_id"])
+        if env2["status"] in ("failed", "completed", "needs_reconciliation", "cancelled"):
+            break
     assert code2 == 200
     assert env2["status"] == "failed"
     assert env2["error"]["code"] == "SENDS_DISABLED"

@@ -358,6 +358,12 @@ class Registry:
             )
             self._conn.commit()
 
+    def get_accounting(self, request_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM token_accounting WHERE request_id=?", (request_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
     # ---- helpers ----
     @staticmethod
     def new_id() -> str:

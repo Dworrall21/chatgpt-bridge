@@ -160,6 +160,20 @@ class JobQueue:
             turn_count=conv.get("turn_count", 0) + 1,
             estimated_context_tokens=conv.get("estimated_context_tokens", 0) + len(prompt_text) // 4,
         )
+        # token accounting (app-side estimates; Hermes-side counters arrive later)
+        registry.record_accounting({
+            "request_id": row["request_id"],
+            "actual_hermes_input_tokens": None,
+            "actual_hermes_output_tokens": None,
+            "delegation_request_tokens": len(prompt_text) // 4,
+            "delegation_result_tokens": len(result_text) // 4,
+            "baseline_method": "unavailable",
+            "baseline_input_tokens": None,
+            "baseline_output_tokens": None,
+            "net_hermes_tokens_saved": None,
+            "savings_percent": None,
+            "measurement_confidence": "unavailable",
+        })
 
     @staticmethod
     def _eligible(conv: dict, cfg) -> bool:

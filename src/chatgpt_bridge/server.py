@@ -60,7 +60,7 @@ def _iso(ts: int | None) -> str | None:
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).isoformat()
 
 
-def build_envelope(config: Config, row: dict) -> dict:
+def build_envelope(config: Config, row: dict, accounting: dict | None = None) -> dict:
     state = row["request_state"]
     status_map = {
         RequestState.RECEIVED.value: "accepted",
@@ -138,7 +138,16 @@ def build_envelope(config: Config, row: dict) -> dict:
             "app_build": None,
             "selector_profile": None,
         },
-        "usage": None,
+        "usage": {
+            "delegation_request_tokens": (accounting or {}).get("delegation_request_tokens"),
+            "delegation_result_tokens": (accounting or {}).get("delegation_result_tokens"),
+            "actual_hermes_tokens": None,
+            "baseline_hermes_tokens": None,
+            "net_hermes_tokens_saved": None,
+            "savings_percent": None,
+            "baseline_method": (accounting or {}).get("baseline_method"),
+            "measurement_confidence": (accounting or {}).get("measurement_confidence"),
+        },
         "result": result,
         "error": error,
     }
@@ -211,7 +220,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if row is None:
                 self._json(404, {"error": {"code": "NOT_FOUND", "message": "unknown request_id"}})
                 return
-            self._json(200, build_envelope(self.state.config, row))
+            self._json(200, build_envelope(self.state.config, row, self.state.registry.get_accounting(row["request_id"])))
             return
 
     def do_POST(self) -> None:
@@ -230,7 +239,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.state.registry.set_request_state(request_id, RequestState.CANCELLED)
             updated = self.state.registry.get_request(request_id)
             if updated is not None:
-                self._json(200, build_envelope(self.state.config, updated))
+                self._json(200, build_envelope(self.state.config, updated, self.state.registry.get_accounting(updated["request_id"])))
             else:
                 self._json(500, {"error": {"code": "INTERNAL", "message": "lost request"}})
             return
@@ -274,7 +283,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._json(409, {"error": {"code": "IDEMPOTENCY_CONFLICT", "message": "same key, different content"}})
                 return
             self.state.metrics.incr("idempotency_hit")
-            self._json(200, build_envelope(self.state.config, existing))
+            self._json(200, build_envelope(self.state.config, existing, self.state.registry.get_accounting(existing["request_id"])))
             return
 
         policy = ContentPolicy(
@@ -321,7 +330,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.state.queue.enqueue(request_id, session_key)
         self.state.metrics.incr("delegations_created")
         self.state.metrics.event("delegation_created", request_id=request_id)
-        self._json(202, build_envelope(self.state.config, self.state.registry.get_request(request_id)))
+        self._json(202, build_envelope(self.state.config, self.state.registry.get_request(request_id), self.state.registry.get_accounting(request_id)))
 
     def log_message(self, format, *args):  # silence default stderr noise; redacted
         pass
