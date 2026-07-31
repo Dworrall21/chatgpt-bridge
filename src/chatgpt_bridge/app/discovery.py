@@ -88,6 +88,50 @@ _JS_MODEL_MENU = """
 """
 
 
+_JS_STORAGE_SOURCES = """
+() => {
+  const out = [];
+  const scan = (label, items) => {
+    for (const [k, v] of items) {
+      if (!v) continue;
+      const s = String(v);
+      if (s.includes('chatgpt-bridge') && s.includes('cloud:')) out.push({ label, key: k, snippet: s.slice(0, 400) });
+    }
+  };
+  const ls = []; for (let i = 0; i < localStorage.length; i++) ls.push([localStorage.key(i), localStorage.getItem(localStorage.key(i))]);
+  scan('localStorage', ls);
+  const ss = []; for (let i = 0; i < sessionStorage.length; i++) ss.push([sessionStorage.key(i), sessionStorage.getItem(sessionStorage.key(i))]);
+  scan('sessionStorage', ss);
+  return out;
+}
+"""
+
+_JS_IDB_SOURCES = """
+async () => {
+  const out = [];
+  try {
+    const dbs = await indexedDB.databases();
+    for (const dbInfo of dbs) {
+      const db = await new Promise((res, rej) => { const r = indexedDB.open(dbInfo.name); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      for (const storeName of Array.from(db.objectStoreNames)) {
+        let tx;
+        try { tx = db.transaction(storeName, 'readonly'); } catch { continue; }
+        const store = tx.objectStore(storeName);
+        const req = store.getAll();
+        await new Promise((res, rej) => { req.onsuccess = res; req.onerror = () => rej(req.error); });
+        for (const rec of req.result || []) {
+          const s = JSON.stringify(rec);
+          if (s.includes('chatgpt-bridge') && s.includes('cloud:')) out.push({ db: dbInfo.name, store: storeName, snippet: s.slice(0, 400) });
+        }
+      }
+      db.close();
+    }
+  } catch (e) { out.push({ error: String(e) }); }
+  return out;
+}
+"""
+
+
 def _capture_project_id(entries: list[dict]) -> list[str]:
     """Collect candidate opaque IDs from hrefs/data attributes."""
     ids: list[str] = []
@@ -151,7 +195,18 @@ def discover(*, cdp_url: str = "http://127.0.0.1:9222", renderer_origin: str = "
             attrs = x.get("attrs", {}) or {}
             if attrs.get("data-app-action-sidebar-project-id") == pinned_row_id or attrs.get("href") == pinned_row_id:
                 carriers.append(x)
-        id_sources = len({id(e) for e in carriers}) if pinned_row_id else 0
+        dom_id_sources = len({id(e) for e in carriers}) if pinned_row_id else 0
+
+        # Independent sources beyond DOM: app storage (read-only, no navigation).
+        storage_sources = pg.evaluate(_JS_STORAGE_SOURCES)
+        idb_sources = pg.evaluate(_JS_IDB_SOURCES)
+        storage_hits = []
+        for hit in storage_sources + idb_sources:
+            if "error" in hit:
+                continue
+            if pinned_row_id and pinned_row_id in hit.get("snippet", ""):
+                storage_hits.append(hit)
+        id_sources = dom_id_sources + (1 if storage_hits else 0)
 
         # Model picker observation (read-only; trusted CDP click, closes menu afterwards).
         model = None
@@ -178,8 +233,9 @@ def discover(*, cdp_url: str = "http://127.0.0.1:9222", renderer_origin: str = "
                 "pinned_project_id": pinned_row_id,
                 "candidate_ids": unique_ids,
                 "id_sources": id_sources,
+                "storage_sources": storage_sources + idb_sources,
                 "enrollment_ready": id_sources >= 2,
-                "note": "opaque ID must be confirmed from >=2 independent DOM sources before Phase 2",
+                "note": "opaque ID must be confirmed from >=2 independent sources before Phase 2",
             },
             "model_picker": model,
             "account_fingerprint": account_fingerprint,

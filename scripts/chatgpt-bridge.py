@@ -42,6 +42,27 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_enroll(args: argparse.Namespace) -> int:
+    """Run discovery (must reach >=2 ID sources), then persist the binding."""
+    from chatgpt_bridge.app.discovery import discover
+    from chatgpt_bridge.app.project_guard import ProjectGuard
+    from chatgpt_bridge.config import Config
+    from chatgpt_bridge.registry import Registry
+
+    cfg = Config.load(args.config)
+    result = discover(cdp_url=args.cdp_url, renderer_origin=args.renderer_origin)
+    registry = Registry(args.db)
+    try:
+        guard = ProjectGuard(cfg, registry)
+        binding = guard.enroll(result)
+        import json
+
+        print(json.dumps({"ok": True, "binding": binding}, indent=2, default=str))
+        return 0
+    finally:
+        registry.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="chatgpt-bridge")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -57,6 +78,13 @@ def main() -> int:
     disc.add_argument("--cdp-url", default="http://127.0.0.1:9222")
     disc.add_argument("--renderer-origin", default="http://127.0.0.1:5175")
     disc.set_defaults(func=cmd_discover)
+
+    enr = sub.add_parser("enroll", help="discover then persist the project binding (requires >=2 ID sources)")
+    enr.add_argument("--config", default=None)
+    enr.add_argument("--db", default=os.path.expanduser("~/.local/state/chatgpt-bridge/registry.sqlite3"))
+    enr.add_argument("--cdp-url", default="http://127.0.0.1:9222")
+    enr.add_argument("--renderer-origin", default="http://127.0.0.1:5175")
+    enr.set_defaults(func=cmd_enroll)
 
     args = parser.parse_args()
     return args.func(args)
