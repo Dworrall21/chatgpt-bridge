@@ -236,18 +236,39 @@ class DesktopDriver:
                 raise SendAmbiguousError("prompt sentinel not found in conversation after send")
 
             deadline = time.time() + timeout_s
+            stable = 0
+            last_tail_hash = None
             while time.time() < deadline:
                 time.sleep(poll_s)
                 try:
                     txt = page.evaluate("() => document.body.innerText")
                 except Exception:
                     continue
-                # completion is authoritative: HERMES-DONE within the CURRENT
-                # turn's ASSISTANT area (after the user block timestamp).
-                # Never return partial text; never match the prompt's own
-                # instruction line.
-                if "HERMES-DONE" in self._tail_after_user(txt):
+                tail = self._tail_after_user(txt)
+                # authoritative completion: HERMES-DONE in the assistant area
+                if "HERMES-DONE" in tail:
                     return self._extract_response(txt)
+                # fallback: finished-looking tail (assistant text, no 'Thinking')
+                # that is stable across consecutive polls and no Stop control.
+                try:
+                    stop = page.locator('button[aria-label*="Stop" i], [data-testid="stop-button"]').count()
+                except Exception:
+                    stop = 1
+                looks_done = "ChatGPT said:" in tail and "Thinking" not in tail
+                if looks_done and stop == 0:
+                    import hashlib
+
+                    h = hashlib.sha256(tail.encode("utf-8")).hexdigest()
+                    if h == last_tail_hash:
+                        stable += 1
+                        if stable >= 4:
+                            return self._extract_response(txt)
+                    else:
+                        stable = 0
+                        last_tail_hash = h
+                else:
+                    stable = 0
+                    last_tail_hash = None
                 if self._approval_card(page):
                     raise ToolApprovalRequestedError("tool approval UI appeared; never approving")
             raise CompletionTimeoutError(f"no HERMES-DONE within {timeout_s}s")

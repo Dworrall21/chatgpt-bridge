@@ -1,0 +1,12 @@
+[Unit]
+Description=ChatGPT bridge supervisor (daemon lives only while a Hermes instance runs)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/david/Projects/chatgpt-bridge/scripts/daemon-supervisor.py --poll 15 --grace 120
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

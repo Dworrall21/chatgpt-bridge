@@ -24,6 +24,47 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     server = serve(cfg, registry, queue, metrics, sock_path=args.socket)
     print(f"chatgpt-bridge listening on {args.socket or cfg.transport.resolve_socket_path()}", flush=True)
     print(f"flags: enabled={cfg.flags.bridge_enabled} create={cfg.flags.allow_conversation_creation} send={cfg.flags.allow_send} autoroute={cfg.flags.automatic_routing}", flush=True)
+    import signal
+
+    def _shutdown(signum, frame):  # noqa: ARG001
+        print("shutting down", flush=True)
+        server.shutdown()
+        server.server_close()
+        registry.close()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    # Idle watchdog: exit when no Hermes instance has been seen for
+    # --idle-timeout seconds (daemon lives only while Hermes runs).
+    if args.idle_timeout and args.idle_timeout > 0:
+        def _watchdog():
+            import importlib.util
+            import time as _t
+
+            spec = importlib.util.spec_from_file_location(
+                "daemon_supervisor",
+                os.path.join(os.path.dirname(__file__), "daemon-supervisor.py"),
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            since: float | None = None
+            while True:
+                _t.sleep(15)
+                if mod.hermes_instances() > 0:
+                    since = None
+                    continue
+                if since is None:
+                    since = _t.time()
+                if _t.time() - since >= args.idle_timeout:
+                    print(f"no Hermes instance for {args.idle_timeout}s — shutting down", flush=True)
+                    _shutdown(signal.SIGTERM, None)
+
+        import threading
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -73,6 +114,8 @@ def main() -> int:
     d.add_argument("--db", default=os.path.expanduser("~/.local/state/chatgpt-bridge/registry.sqlite3"))
     d.add_argument("--socket", default=None, help="override socket path")
     d.add_argument("--metrics-jsonl", default=None)
+    d.add_argument("--idle-timeout", type=int, default=120,
+                   help="exit after N seconds with no Hermes instance (0 disables)")
     d.set_defaults(func=cmd_daemon)
 
     disc = sub.add_parser("discover", help="Phase 1: read-only app + project discovery")

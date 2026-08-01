@@ -53,6 +53,7 @@ def build_prompt(payload: dict) -> str:
         lines.append(f"- Style: {detail_rule}")
     lines.append("")
     lines.append("End your response with exactly: HERMES-DONE")
+    lines.append("(The HERMES-DONE marker is MANDATORY and is the last line of your response. Without it the response is discarded.)")
     return "\n".join(lines)
 
 

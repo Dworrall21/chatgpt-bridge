@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -37,6 +38,48 @@ def _read_context(spec: str) -> tuple[str, str]:
         label, path = Path(spec).name, spec
     content = Path(path).read_text(encoding="utf-8", errors="replace")
     return label, content
+
+
+def _daemon_up(sock_path: str) -> bool:
+    import socket as _s
+
+    try:
+        s = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(sock_path)
+        s.sendall(b"GET /v1/health HTTP/1.1\r\nHost: bridge\r\nConnection: close\r\n\r\n")
+        data = b""
+        while True:
+            part = s.recv(4096)
+            if not part:
+                break
+            data += part
+        s.close()
+        return b"200" in data.split(b"\r\n")[0]
+    except Exception:
+        return False
+
+
+def _spawn_daemon(hmac_secret: bytes) -> None:
+    repo = os.path.join(os.path.dirname(__file__), "..", "..")
+    env = dict(os.environ)
+    env.update({
+        "CHATGPT_BRIDGE_ENABLED": "1",
+        "CHATGPT_BRIDGE_ALLOW_CREATE": "1",
+        "CHATGPT_BRIDGE_ALLOW_SEND": "1",
+        "CHATGPT_BRIDGE_HMAC_SECRET": hmac_secret.decode(),
+    })
+    subprocess.Popen(
+        [sys.executable, os.path.join(repo, "scripts", "chatgpt-bridge.py"), "daemon",
+         "--config", os.path.join(repo, "config", "bridge.example.toml"),
+         "--db", os.path.expanduser("~/.local/state/chatgpt-bridge/registry.sqlite3"),
+         "--metrics-jsonl", os.path.expanduser("~/.local/state/chatgpt-bridge/metrics.jsonl"),
+         "--idle-timeout", "120"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def main() -> int:
@@ -109,6 +152,14 @@ def main() -> int:
     secret = cfg.transport.secret()
     sock = cfg.transport.resolve_socket_path()
     client = BridgeClient(sock, secret, connect_timeout=5.0)
+
+    # Auto-start the daemon if it is not listening (Hermes-driven lifecycle).
+    if not _daemon_up(sock):
+        _spawn_daemon(secret)
+        for _ in range(30):
+            if _daemon_up(sock):
+                break
+            time.sleep(0.5)
 
     code, env = client.submit(request)
     if code not in (200, 202):

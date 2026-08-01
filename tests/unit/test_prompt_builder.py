@@ -51,4 +51,7 @@ def test_detail_rules_emitted():
 
 def test_prompt_ends_with_done_marker():
     p = build_prompt(_payload())
-    assert p.rstrip().endswith("HERMES-DONE")
+    assert "End your response with exactly: HERMES-DONE" in p
+    assert "MANDATORY" in p
+    # the marker instruction line comes after the contract block
+    assert p.index("End your response with exactly: HERMES-DONE") > p.index("Required output:")
