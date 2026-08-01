@@ -46,7 +46,10 @@ def main() -> int:
     ap.add_argument("--context", action="append", default=[], help="label=/path/file (repeatable)")
     ap.add_argument("--constraint", action="append", default=[])
     ap.add_argument("--output-format", default="markdown", choices=["text", "markdown", "json"])
-    ap.add_argument("--max-characters", type=int, default=6000)
+    ap.add_argument("--detail", default="standard", choices=["brief", "standard", "detailed"],
+                    help="response depth: brief (~1.2k chars), standard (~4k), detailed (~12k)")
+    ap.add_argument("--max-characters", type=int, default=None,
+                    help="explicit output cap; overrides the --detail default")
     ap.add_argument("--session-id", default=os.environ.get("HERMES_SESSION_ID", "cli"))
     ap.add_argument("--new-shard", action="store_true", help="force a new project conversation (default: reuse session conversation)")
     ap.add_argument("--timeout", type=int, default=900)
@@ -68,13 +71,16 @@ def main() -> int:
 
     # Compact packet.
     selected_facts = [_read_context(spec) for spec in args.context]
+    detail_defaults = {"brief": 1200, "standard": 4000, "detailed": 12000}
+    max_chars = args.max_characters or detail_defaults.get(args.detail, 4000)
     packed = pack_context(
         instruction=args.instruction,
         constraints=args.constraint or None,
         selected_facts=selected_facts,
         output_format=args.output_format,
-        max_characters=args.max_characters,
+        max_characters=max_chars,
     )
+    packed.output_contract["detail"] = args.detail
 
     request = {
         "protocol_version": "1.0",

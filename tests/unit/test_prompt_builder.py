@@ -32,7 +32,21 @@ def test_prompt_contains_context_and_contract():
     assert "read-only" in p
     assert "Maximum length: 6000" in p
     assert "Section: Conclusion" in p
+    assert "Detail level: standard" in p
     assert "HERMES-DONE" in p
+
+
+def test_detail_rules_emitted():
+    for detail in ("brief", "standard", "detailed"):
+        payload = _payload()
+        payload["task"]["output_contract"] = {
+            **payload["task"]["output_contract"],
+            "detail": detail,
+            "max_characters": {"brief": 1200, "standard": 4000, "detailed": 12000}[detail],
+        }
+        p = build_prompt(payload)
+        assert f"Detail level: {detail}" in p
+        assert "Style:" in p
 
 
 def test_prompt_ends_with_done_marker():

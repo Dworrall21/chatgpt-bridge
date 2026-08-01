@@ -120,6 +120,15 @@ class JobQueue:
         registry.set_request_state(job.request_id, RequestState.PROJECT_VERIFIED)
 
         # conversation selection: reuse when eligible, else create (new shard)
+        # ProjectGuard confinement: binding must be enrolled and current.
+        from .app.project_guard import BINDING_ID, ProjectGuard
+        from .errors import ProjectAssertionFailedError, ProjectConfinementBreachError
+
+        guard = ProjectGuard(cfg, registry)
+        binding = guard.require_binding()
+        if binding["project_id"] != driver.project_id:
+            raise ProjectConfinementBreachError("binding project != configured project")
+
         conv = registry.get_active_conversation(job.session_key)
         policy = row.get("policy") or "reuse_session"
         if policy == "new_shard":
@@ -132,9 +141,13 @@ class JobQueue:
         else:
             conv = None
         if conv is None:
+            if not flags.allow_conversation_creation:
+                raise ProjectAssertionFailedError("conversation creation disabled (CHATGPT_BRIDGE_ALLOW_CREATE != 1)")
             conv = driver.create_conversation(
                 job.session_key, title=f"HB {job.session_key[:8]} · S1 · {row.get('task_id', 'task')[:40]}"
             )
+        # account fingerprint must still match the enrolled binding
+        driver.assert_account_matches(binding)
         registry.set_request_conversation(row["request_id"], conv["conversation_id"])
         registry.set_request_state(job.request_id, RequestState.CONVERSATION_BOUND)
         registry.set_request_state(job.request_id, RequestState.MODEL_VERIFIED)
@@ -144,6 +157,9 @@ class JobQueue:
         registry.set_request_state(job.request_id, RequestState.SENT)
         registry.set_request_state(job.request_id, RequestState.WAITING)
 
+        # final boundary gate before the actual send
+        if not flags.allow_send:
+            raise ProjectAssertionFailedError("sends disabled (CHATGPT_BRIDGE_ALLOW_SEND != 1)")
         result_text = driver.send_and_wait(prompt_text)
         import hashlib
 

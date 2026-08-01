@@ -126,6 +126,11 @@ class Config:
             conversation = ConversationConfig(**{k: v for k, v in c.items() if k in ConversationConfig.__dataclass_fields__})
             security = SecurityConfig(**{k: v for k, v in s.items() if k in SecurityConfig.__dataclass_fields__})
 
+        # Fail closed: when peer-UID checking is on, pin to the current UID unless
+        # an explicit UID was configured.
+        if transport.require_peer_uid and transport.allowed_peer_uid is None:
+            transport = TransportConfig(**{**transport.__dict__, "allowed_peer_uid": os.getuid()})
+
         flags = Flags(
             bridge_enabled=_env_bool("CHATGPT_BRIDGE_ENABLED", False),
             allow_conversation_creation=_env_bool("CHATGPT_BRIDGE_ALLOW_CREATE", False),

@@ -14,7 +14,7 @@ import uuid
 
 import pytest
 
-from chatgpt_bridge.config import Config, TransportConfig
+from chatgpt_bridge.config import Config, Flags, TransportConfig
 from chatgpt_bridge.metrics import Metrics
 from chatgpt_bridge.queue import JobQueue
 from chatgpt_bridge.registry import Registry
@@ -40,6 +40,7 @@ def daemon(tmp_path):
             hmac_secret="test-secret",
             allowed_peer_uid=os.getuid(),
         ),
+        flags=Flags(bridge_enabled=True, allow_conversation_creation=True, allow_send=False),
     )
     registry = Registry(db)
     metrics = Metrics()

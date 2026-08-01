@@ -76,6 +76,7 @@
           "required": ["format", "max_characters"],
           "properties": {
             "format": {"enum": ["text", "markdown", "json"]},
+            "detail": {"enum": ["brief", "standard", "detailed"], "default": "standard"},
             "max_characters": {"type": "integer", "minimum": 256, "maximum": 100000},
             "required_sections": {
               "type": "array",

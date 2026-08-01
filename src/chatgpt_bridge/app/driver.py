@@ -34,6 +34,44 @@ class DesktopDriver:
         self.config = config
         self.registry = registry
         self.project_id = config.app.required_project_id or "cloud:Dworrall21/chatgpt-bridge"
+        self._assert_loopback_cdp(config.app.cdp_url)
+
+    @staticmethod
+    def _assert_loopback_cdp(cdp_url: str) -> None:
+        from urllib.parse import urlparse
+
+        host = urlparse(cdp_url).hostname or ""
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise ProjectConfinementBreachError(f"CDP endpoint must be loopback, got {host!r}")
+
+    @staticmethod
+    def _verify_renderer(page: Any, origin: str) -> None:
+        from ..errors import AppIdentityMismatchError
+
+        identity = page.evaluate(
+            """() => ({ origin: location.origin, bridge: typeof window.electronBridge === 'object' })"""
+        )
+        if identity.get("origin") != origin or not identity.get("bridge"):
+            raise AppIdentityMismatchError(f"renderer identity mismatch: {identity}")
+
+    def project_fingerprint(self) -> str:
+        with CdpClient(self.config.app.cdp_url) as client:
+            renderer = find_renderer(client, self.config.app.renderer_origin)
+            if renderer is None:
+                raise ProjectNotFoundError("no renderer found")
+            page = renderer.page
+            ua = page.evaluate("() => navigator.userAgent") or ""
+            return f"origin:{self.config.app.renderer_origin}|ua:{ua[:64]}"
+
+    def assert_account_matches(self, binding: dict) -> None:
+        from ..errors import AccountMismatchError
+
+        enrolled = binding.get("account_fingerprint") or ""
+        if enrolled in ("", "unknown"):
+            return  # never enrolled with a fingerprint; nothing to compare
+        current = self.project_fingerprint()
+        if current != enrolled:
+            raise AccountMismatchError("account fingerprint changed since enrollment")
 
     # ---- conversation lifecycle -----------------------------------------
     def create_conversation(self, session_key: str, title: str) -> dict:
@@ -43,6 +81,7 @@ class DesktopDriver:
             if renderer is None:
                 raise ProjectNotFoundError("no renderer found")
             page = renderer.page
+            self._verify_renderer(page, self.config.app.renderer_origin)
             row = page.locator(f'[data-app-action-sidebar-project-id="{self.project_id}"]')
             if row.count() == 0:
                 raise ProjectConfinementBreachError("pinned project row not in sidebar")
@@ -111,6 +150,7 @@ class DesktopDriver:
             if renderer is None:
                 raise ProjectNotFoundError("no renderer found")
             page = renderer.page
+            self._verify_renderer(page, self.config.app.renderer_origin)
             row = page.locator(f'[data-app-action-sidebar-thread-id="{thread_id}"]')
             if row.count() == 0:
                 # sidebar may need the project expanded: open the project first
@@ -125,6 +165,27 @@ class DesktopDriver:
             page.wait_for_timeout(2200)
             if _visible_textbox(page) is None:
                 raise ConversationMetadataUnavailableError("composer did not open for existing thread")
+            # confinement: active thread must equal the requested id AND sit
+            # inside the pinned project section of the sidebar
+            placement = page.evaluate(
+                """(o) => {
+                  const pid = o.pid, tid = o.tid;
+                  const rows=[...document.querySelectorAll('[data-app-action-sidebar-project-id],[data-app-action-sidebar-thread-id]')];
+                  let proj=-1, thread=-1;
+                  rows.forEach((r,i)=>{
+                    if (r.getAttribute('data-app-action-sidebar-project-id')===pid) proj=i;
+                    if (r.getAttribute('data-app-action-sidebar-thread-id')===tid) thread=i;
+                  });
+                  const active = document.querySelector('[data-app-action-sidebar-thread-active="true"]');
+                  return { proj, thread, placed: proj>=0 && thread>proj,
+                           active: active ? active.getAttribute('data-app-action-sidebar-thread-id') : null };
+                }""",
+                {"pid": self.project_id, "tid": thread_id},
+            )
+            if not placement.get("placed") or placement.get("active") != thread_id:
+                raise ProjectConfinementBreachError(
+                    f"thread {thread_id} not confined to project section: {placement}"
+                )
 
     def read_conversation(self, thread_id: str) -> str:
         """Open a conversation and return its body text (for reconciliation)."""
@@ -134,12 +195,26 @@ class DesktopDriver:
             return renderer.page.evaluate("() => document.body.innerText")
 
     # ---- send ------------------------------------------------------------
+    @staticmethod
+    def _tail_after_user(txt: str) -> str:
+        """Text after the LAST user turn's timestamp (excludes the prompt
+        itself, which contains the HERMES-DONE instruction line)."""
+        idx = txt.rfind("You said:")
+        if idx < 0:
+            return txt
+        rest = txt[idx:]
+        m = re.search(r"\d{1,2}:\d{2}\s*(AM|PM)", rest)
+        if m:
+            rest = rest[m.end():]
+        return rest
+
     def send_and_wait(self, prompt: str, *, timeout_s: int = 900, poll_s: float = 2.0) -> str:
         with CdpClient(self.config.app.cdp_url) as client:
             renderer = find_renderer(client, self.config.app.renderer_origin)
             if renderer is None:
                 raise ProjectNotFoundError("no renderer found")
             page = renderer.page
+            self._verify_renderer(page, self.config.app.renderer_origin)
 
             self._enforce(page)
 
@@ -167,20 +242,15 @@ class DesktopDriver:
                     txt = page.evaluate("() => document.body.innerText")
                 except Exception:
                     continue
-                if "HERMES-DONE" in txt:
-                    return self._extract_response(txt)
-                # completion signal: the Stop/Responding control must be GONE
-                # (body-text markers are unreliable — stale 'Thinking' text persists)
-                try:
-                    stop = page.locator('button[aria-label*="Stop" i], button[aria-label*="stop generation" i], [data-testid="stop-button"]').count()
-                    responding = page.get_by_text("Responding", exact=False).count()
-                except Exception:
-                    stop, responding = 1, 1
-                if stop == 0 and responding == 0:
+                # completion is authoritative: HERMES-DONE within the CURRENT
+                # turn's ASSISTANT area (after the user block timestamp).
+                # Never return partial text; never match the prompt's own
+                # instruction line.
+                if "HERMES-DONE" in self._tail_after_user(txt):
                     return self._extract_response(txt)
                 if self._approval_card(page):
                     raise ToolApprovalRequestedError("tool approval UI appeared; never approving")
-            raise CompletionTimeoutError(f"no stable response within {timeout_s}s")
+            raise CompletionTimeoutError(f"no HERMES-DONE within {timeout_s}s")
 
     @staticmethod
     def _insert_text(page: Any, box: Any, text: str) -> None:

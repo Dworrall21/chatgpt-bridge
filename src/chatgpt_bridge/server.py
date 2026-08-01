@@ -216,6 +216,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/v1/delegations/"):
             request_id = self.path[len("/v1/delegations/") :].split("/")[0]
+            try:
+                self._verify_auth(b"")
+            except BridgeError as e:
+                self.state.metrics.incr("auth_rejected")
+                self._json(401, {"error": e.to_envelope()})
+                return
             row = self.state.registry.get_request(request_id)
             if row is None:
                 self._json(404, {"error": {"code": "NOT_FOUND", "message": "unknown request_id"}})
@@ -229,6 +235,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/v1/delegations/") and self.path.endswith("/cancel"):
             request_id = self.path[len("/v1/delegations/") :].split("/")[0]
+            try:
+                self._verify_auth(b"")
+            except BridgeError as e:
+                self.state.metrics.incr("auth_rejected")
+                self._json(401, {"error": e.to_envelope()})
+                return
             row = self.state.registry.get_request(request_id)
             if row is None:
                 self._json(404, {"error": {"code": "NOT_FOUND", "message": "unknown request_id"}})
@@ -256,6 +268,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
         })
 
     def _create_delegation(self) -> None:
+        # master switch enforced at the side-effect boundary
+        if not self.state.config.flags.bridge_enabled:
+            self._json(503, {"error": {"code": "BRIDGE_DISABLED", "message": "bridge disabled (CHATGPT_BRIDGE_ENABLED != 1)"}})
+            return
         body = self._read_body()
         try:
             self._verify_auth(body)
@@ -350,5 +366,11 @@ def serve(config: Config, registry: Registry, queue: JobQueue, metrics: Metrics,
         pass
     server = UnixStreamServer(path, BridgeHandler)
     os.chmod(path, 0o600)
-    server.bridge_state = BridgeState(config, registry, queue, metrics, nonce_guard or NonceGuard())  # type: ignore[attr-defined]
+    server.bridge_state = BridgeState(  # type: ignore[attr-defined]
+        config,
+        registry,
+        queue,
+        metrics,
+        nonce_guard or NonceGuard(window_seconds=config.transport.nonce_replay_window_seconds),
+    )
     return server

@@ -44,9 +44,20 @@ def build_prompt(payload: dict) -> str:
     lines.append("")
     lines.append("Required output:")
     lines.append(f"- Format: {contract['format']}")
+    lines.append(f"- Detail level: {contract.get('detail', 'standard')}")
     lines.append(f"- Maximum length: {contract['max_characters']} characters")
     for s in sections:
         lines.append(f"- Section: {s}")
+    detail_rule = _DETAIL_RULES.get(contract.get("detail", "standard"))
+    if detail_rule:
+        lines.append(f"- Style: {detail_rule}")
     lines.append("")
     lines.append("End your response with exactly: HERMES-DONE")
     return "\n".join(lines)
+
+
+_DETAIL_RULES = {
+    "brief": "extremely concise; bullets or a short paragraph only, no preamble, no repetition; say only what is needed",
+    "standard": "clear and complete but economical; direct sections without padding",
+    "detailed": "thorough and exhaustive; cover every section fully, include concrete examples, edge cases, and rationale; use the full allowed length",
+}
