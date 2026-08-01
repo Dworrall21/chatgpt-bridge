@@ -91,11 +91,15 @@ def build_envelope(config: Config, row: dict, accounting: dict | None = None) ->
         }
     result = None
     if state == RequestState.COMPLETED.value and row.get("result_text"):
+        truncated = bool(row.get("result_truncated")) or (
+            config.security.max_result_chars
+            and len(row["result_text"]) >= config.security.max_result_chars
+        )
         result = {
             "mime_type": "text/markdown",
             "text": row["result_text"],
             "sha256": row.get("response_hash"),
-            "truncated": False,
+            "truncated": truncated,
             "full_response_retained": True,
         }
     return {

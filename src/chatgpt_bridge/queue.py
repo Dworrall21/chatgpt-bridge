@@ -161,13 +161,21 @@ class JobQueue:
         if not flags.allow_send:
             raise ProjectAssertionFailedError("sends disabled (CHATGPT_BRIDGE_ALLOW_SEND != 1)")
         result_text = driver.send_and_wait(prompt_text)
-        import hashlib
 
+        # route the result through the configured output gate (bounded, flagged)
+        from .security.output_gate import OutputGate
+
+        gated = OutputGate(max_result_chars=cfg.security.max_result_chars).gate(result_text)
+        if gated.truncated:
+            from .metrics import Metrics
+
+            Metrics().incr("results_truncated")
         registry.set_result_text(
             row["request_id"],
-            result_text,
-            response_hash=hashlib.sha256(result_text.encode("utf-8")).hexdigest(),
+            gated.text,
+            response_hash=gated.sha256,
         )
+        registry.set_truncated(row["request_id"], gated.truncated)
         # capture the app thread id now that the thread row exists post-send
         href = driver.capture_active_thread_id()
         if href and conv.get("conversation_href") != href:

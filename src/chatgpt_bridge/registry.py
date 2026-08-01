@@ -100,6 +100,7 @@ _ALTERS = [
     "ALTER TABLE requests ADD COLUMN prompt_text TEXT",
     "ALTER TABLE requests ADD COLUMN result_text TEXT",
     "ALTER TABLE requests ADD COLUMN policy TEXT",
+    "ALTER TABLE requests ADD COLUMN result_truncated INTEGER",
 ]
 
 
@@ -327,6 +328,14 @@ class Registry:
             self._conn.execute(
                 "UPDATE requests SET result_text=?, response_hash=COALESCE(?, response_hash) WHERE request_id=?",
                 (result_text, response_hash, request_id),
+            )
+            self._conn.commit()
+
+    def set_truncated(self, request_id: str, truncated: bool) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE requests SET result_truncated=? WHERE request_id=?",
+                (1 if truncated else 0, request_id),
             )
             self._conn.commit()
 
