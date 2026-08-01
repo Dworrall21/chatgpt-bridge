@@ -78,6 +78,9 @@ class JobQueue:
                 job.request_id, RequestState.FAILED, error_code=e.code, error_stage=e.stage
             )
         except Exception as e:  # noqa: BLE001 — journal the failure, never crash the daemon
+            import traceback
+
+            traceback.print_exc()
             self.registry.set_request_state(job.request_id, RequestState.FAILED, error_code="INTERNAL", error_stage="executor")
         finally:
             with self._lock:

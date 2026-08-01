@@ -292,7 +292,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             max_context_item_chars=self.state.config.security.max_context_item_chars,
         )
         try:
-            policy.check(payload["task"])
+            from .security.content_policy import apply_content_policy
+
+            apply_content_policy(policy, payload["task"])
         except PolicyRejectionError as e:
             self.state.metrics.incr("policy_rejected")
             self._json(422, {"error": e.to_envelope()})

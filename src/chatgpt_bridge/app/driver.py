@@ -148,7 +148,7 @@ class DesktopDriver:
                 raise ConversationMetadataUnavailableError("no visible composer textbox")
             box.click(force=True)
             page.wait_for_timeout(300)
-            box.fill(prompt)
+            self._insert_text(page, box, prompt)
             page.wait_for_timeout(300)
             sends = page.locator('button[aria-label="Send prompt"], button[aria-label="Send"]')
             if sends.count():
@@ -167,11 +167,48 @@ class DesktopDriver:
                     txt = page.evaluate("() => document.body.innerText")
                 except Exception:
                     continue
-                if "Ask for approval" in txt and "approval" in txt and self._approval_card(page):
-                    raise ToolApprovalRequestedError("tool approval UI appeared; never approving")
-                if not self._still_running(txt):
+                if "HERMES-DONE" in txt:
                     return self._extract_response(txt)
+                # completion signal: the Stop/Responding control must be GONE
+                # (body-text markers are unreliable — stale 'Thinking' text persists)
+                try:
+                    stop = page.locator('button[aria-label*="Stop" i], button[aria-label*="stop generation" i], [data-testid="stop-button"]').count()
+                    responding = page.get_by_text("Responding", exact=False).count()
+                except Exception:
+                    stop, responding = 1, 1
+                if stop == 0 and responding == 0:
+                    return self._extract_response(txt)
+                if self._approval_card(page):
+                    raise ToolApprovalRequestedError("tool approval UI appeared; never approving")
             raise CompletionTimeoutError(f"no stable response within {timeout_s}s")
+
+    @staticmethod
+    def _insert_text(page: Any, box: Any, text: str) -> None:
+        """Insert prompt into the ProseMirror composer. fill() is used for
+        small prompts; large prompts go through a synthetic paste event which
+        ProseMirror handles far more efficiently."""
+        if len(text) < 20_000:
+            try:
+                box.fill(text)
+                return
+            except Exception:
+                pass
+        ok = page.evaluate(
+            """(t) => {
+                const dt = new DataTransfer();
+                dt.setData('text/plain', t);
+                const el = document.activeElement && document.activeElement.isContentEditable
+                    ? document.activeElement
+                    : document.querySelector('[contenteditable="true"]');
+                if (!el) return false;
+                el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+                return true;
+            }""",
+            text,
+        )
+        if not ok:
+            # last resort: chunked fill
+            box.fill(text[:100_000])
 
     def _enforce(self, page: Any) -> None:
         model = _enforce_model_effort(page)

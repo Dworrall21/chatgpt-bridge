@@ -27,7 +27,7 @@ class CdpClient:
         from playwright.sync_api import sync_playwright
 
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.connect_over_cdp(self.cdp_url)
+        self._browser = self._playwright.chromium.connect_over_cdp(self.cdp_url, timeout=30_000)
         return self
 
     def __exit__(self, *exc):
